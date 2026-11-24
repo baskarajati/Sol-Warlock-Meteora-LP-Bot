@@ -8,7 +8,7 @@ const wib = (d = new Date()) => new Date(d).toLocaleString('sv-SE', { timeZone: 
 const stamp = (d = new Date()) => wib(d).replace(/[-: ]/g, '').replace('WIB', '').replace(/^(\d{8})(\d{4})(\d{2})$/, '$1-$2$3');
 const pnlOf = (h) => (h.pnlUsd != null ? +h.pnlUsd : +h.netPnlUsd || 0);
 const MAX_MODAL = 1_000_000;
-const COPY_FILES = ['state.json', 'summary.json', 'status.json', 'positions_open.json', 'history.csv', 'history_N5.csv', 'history-archived-over500.csv',
+const COPY_FILES = ['state.json', 'summary.json', 'status.json', 'positions_open.json', 'history.csv', 'history_A.csv', 'history_D.csv', 'history_E.csv', 'history_B7.csv', 'history_N5.csv', 'history-archived-over500.csv',
   'reshapes.jsonl', 'repositions.jsonl', 'settings.json', 'sl-blacklist.json', 'config.json', 'history-archive-policy.json'];
 
 function dirs(paperDir) { const root = path.join(paperDir, 'runs'); return { root, pending: path.join(root, 'pending'), done: path.join(root, 'done'), index: path.join(root, 'index.json') }; }
@@ -23,7 +23,7 @@ function writeJsonAtomic(file, obj) { const tmp = file + '.' + process.pid + '.'
 function readIndex(paperDir) { try { const j = JSON.parse(fs.readFileSync(dirs(paperDir).index, 'utf8')); return Array.isArray(j.runs) ? j : { runs: [] }; } catch { return { runs: [] }; } }
 function pendingFiles(paperDir) { const p = dirs(paperDir).pending; return fs.existsSync(p) ? fs.readdirSync(p).filter((x) => /^[a-zA-Z0-9_-]{8,80}\.json$/.test(x)).sort() : []; }
 function currentRun(state, paperDir) {
-  const b = state?.books?.N5 || Object.values(state?.books || {})[0];
+  const b = state?.books?.A || Object.values(state?.books || {})[0];
   const idx = readIndex(paperDir);
   const number = state?.dryRun?.number || (idx.runs.length ? Math.max(...idx.runs.map((r) => r.number)) + 1 : 1);
   return { number, startedAt: state?.dryRun?.startedAt || state?.meta?.startedAt || null, modal: b?.virtual?.totalDepositedUsdc ?? b?.virtual?.usdcStart ?? 0 };
@@ -31,11 +31,21 @@ function currentRun(state, paperDir) {
 function summarize(state, paperDir) {
   const policy = entryPolicy.readArchivePolicy(paperDir);
   const books = Object.values(state.books || {}), all = books.flatMap((b) => b.history || []);
-  const vis = entryPolicy.visible(all, policy), b = books[0] || {}, v = b.virtual || {};
+  const vis = entryPolicy.visible(all, policy);
+  // Batch 1: totals are summed across ALL variant books (4 x $1,000 modal in Window 2),
+  // with a per-book breakdown so the archive index stays honest per variant.
+  const perBook = books.map((b) => {
+    const v = b.virtual || {}, h = b.history || [], vh = entryPolicy.visible(h, policy);
+    const free = (+v.usdc || 0) + ((+v.sol || 0) + (+v.capitalSol || 0)) * (+v.lastCapitalSolUsd || 0);
+    return { id: b.id || null, modal: v.totalDepositedUsdc ?? v.usdcStart ?? 0, trades: h.length, visibleTrades: vh.length,
+      totalPnlUsd: +h.reduce((a, x) => a + pnlOf(x), 0).toFixed(6), visiblePnlUsd: +vh.reduce((a, x) => a + pnlOf(x), 0).toFixed(6),
+      equityUsd: +free.toFixed(6), cashUsdc: +(+v.usdc || 0).toFixed(6) };
+  });
   const totalPnlUsd = all.reduce((a, h) => a + pnlOf(h), 0), visiblePnlUsd = vis.reduce((a, h) => a + pnlOf(h), 0);
-  const free = (+v.usdc || 0) + ((+v.sol || 0) + (+v.capitalSol || 0)) * (+v.lastCapitalSolUsd || 0);
-  return { modal: v.totalDepositedUsdc ?? v.usdcStart ?? 0, trades: all.length, visibleTrades: vis.length, archivedTrades: all.length - vis.length,
-    totalPnlUsd: +totalPnlUsd.toFixed(6), visiblePnlUsd: +visiblePnlUsd.toFixed(6), equityUsd: +free.toFixed(6), cashUsdc: +(+v.usdc || 0).toFixed(6),
+  const modal = perBook.reduce((a, b) => a + b.modal, 0), equityUsd = perBook.reduce((a, b) => a + b.equityUsd, 0), cashUsdc = perBook.reduce((a, b) => a + b.cashUsdc, 0);
+  return { modal, trades: all.length, visibleTrades: vis.length, archivedTrades: all.length - vis.length,
+    totalPnlUsd: +totalPnlUsd.toFixed(6), visiblePnlUsd: +visiblePnlUsd.toFixed(6), equityUsd: +equityUsd.toFixed(6), cashUsdc: +cashUsdc.toFixed(6),
+    books: perBook,
     deposits: (state.capitalDeposits || []).length, calendar: calendar.fromHistory(all, policy), calendarAll: calendar.fromHistory(all, null) };
 }
 function queueNewRun(paperDir, amount, { updatedBy, expectedOldModal, requestId = crypto.randomUUID(), state } = {}) {
