@@ -39,6 +39,7 @@ const liveCloseExec = require('./live-close-exec'); // swap back == dry run: tok
 const liveReshapeExec = require('./live-reshape-exec'); // reshape + compound on the same position == paperReshape
 const liveRepositionExec = require('./live-reposition-exec'); // OOR-right reposition == paperRepositionRight
 const livePositions = require('./live-positions'); // up to MAX_POSITIONS at once, same pick rules as the paper cycle
+const liveSafety = require('./live-safety'); // review fix (24 Nov 2026): v2 live-bugfix set (atomic state, reconcile plan, pending sells)
 const liveExit = require('./live-exit');   // live exit decisions = the dry-run code (paper-usdc.exitQuote + paper-exit-policy.decide)
 const multi = require('./paper-multi');
 const quotePnl=require('./paper-quote-pnl');
@@ -223,10 +224,21 @@ function loadState(file) {
 function saveState(s, file) {
   if (!CFG.PAPER && s && (Array.isArray(s.positions) || s.__active !== undefined)) s = livePositions.persistView(s);   // live: positions[] on disk, position = first
   if(CFG.PAPER&&path.dirname(file)===PAPER_DIR){const tmp=file+'.'+process.pid+'.tmp';fs.writeFileSync(tmp,JSON.stringify(s,null,2));fs.renameSync(tmp,file);}
-  else fs.writeFileSync(file, JSON.stringify(s, null, 2));
+  else liveSafety.atomicWriteJson(file, s);   // H3 (review port): live state is written tmp + fsync + rename (+ .bak), never in place
 }
 
-const conn = new Connection(CFG.RPC, 'confirmed');
+// Review fix (24 Nov 2026): RPC_URL_1..3 failover (v2 rpc-config). One slot keeps the old behaviour; slot 1 = the old single setting.
+const conn = require('./rpc-config').connection('confirmed', { log: (m) => log(m) });
+// M7: one DLMM instance per pool (DLMM.create costs several RPC reads; live used to rebuild it every ~10 s per position). State is refreshed when older than maxAgeMs
+// or when the caller is about to build transactions (fresh: true). getActiveBin()/getPosition() always read the chain themselves.
+const dlmmCache = liveSafety.ttlCache(15 * 60_000, 32);
+async function dlmmFor(pool, { fresh = false, maxAgeMs = 60_000 } = {}) {
+  let e = dlmmCache.get(pool);
+  if (!e) { e = { d: await DLMM.create(conn, new PublicKey(pool)), at: Date.now() }; dlmmCache.set(pool, e); return e.d; }
+  if (fresh || Date.now() - e.at > maxAgeMs) { try { await e.d.refetchStates(); e.at = Date.now(); } catch { dlmmCache.delete(pool); e = { d: await DLMM.create(conn, new PublicKey(pool)), at: Date.now() }; dlmmCache.set(pool, e); } }
+  return e.d;
+}
+async function walletTokenRawOf(mint) { const accs = await conn.getParsedTokenAccountsByOwner(wallet.publicKey, { mint: new PublicKey(mint) }); return { raw: accs.value.reduce((t, a) => t + BigInt(a.account.data.parsed.info.tokenAmount.amount), 0n), accs }; }
 let wallet = null; // only set in live mode
 const USER_PUB = REAL_WALLET ? new PublicKey(REAL_WALLET) : PublicKey.default;   // placeholder for unsigned paper tx builds when no wallet is stored
 
@@ -2019,18 +2031,109 @@ function addPriority(tx) {
   if (!has) tx.instructions.unshift(ComputeBudgetProgram.setComputeUnitPrice({ microLamports: CFG.PRIORITY_MICROLAMPORTS }));
   return tx;
 }
-async function send(tx, signers, label) {
+async function send(tx, signers, label, opts = {}) {
   if (CFG.PAPER || CFG.DRY_RUN || process.env.LIVE_CONFIRMED !== '1') {
     throw new Error('send() blocked: paper/dry-run or LIVE_CONFIRMED missing');
   }
   addPriority(tx);
   const { blockhash, lastValidBlockHeight } = await conn.getLatestBlockhash();
   tx.recentBlockhash = blockhash; tx.feePayer = wallet.publicKey; tx.sign(...signers);
-  const sig = await conn.sendRawTransaction(tx.serialize(), { maxRetries: 5 });
-  const c = await conn.confirmTransaction({ signature: sig, blockhash, lastValidBlockHeight }, 'confirmed');
-  if (c.value.err) throw new Error(`${label} failed ${sig} ${JSON.stringify(c.value.err)}`);
+  const raw = tx.serialize();
+  const sig = await conn.sendRawTransaction(raw, { maxRetries: 5 });
+  if (typeof opts.onSig === 'function') { try { await opts.onSig(sig); } catch { /* bookkeeping hook must never break the send */ } }   // H1/M2: the caller records the signature before confirmation
+  await confirmRaw(raw, sig, label, lastValidBlockHeight);
   log(`  tx ${label} confirmed ${sig}`);
   return sig;
+}
+// Review fix (24 Nov 2026): the confirm loop of send(), shared with the Jupiter swaps (they used a single confirmTransaction, so a
+// swap could land and still throw, and a retry then swapped the same SOL again). Throws err.sig on expiry, err.sig + err.unknownStatus
+// when the status cannot be read, err.sig + err.failedOnChain when the transaction landed with an error (nothing moved).
+async function confirmRaw(raw, sig, label, lastValidBlockHeight) {
+  // Keep re-broadcasting the SAME signed transaction every ~1.5 s until it is confirmed or its blockhash expires: a single send is often dropped under load (that is what produced 'block height exceeded').
+  const t0 = Date.now();
+  for (;;) {
+    let st = null;
+    try { st = (await conn.getSignatureStatuses([sig])).value[0]; }
+    catch (e) {   // H2: an RPC error (429) while polling must not be read as "not sent": keep polling until the blockhash really expires
+      if (Date.now() - t0 > 180_000) { const err = new Error(`${label}: status of ${sig} unknown after 180 s (${e.message})`); err.sig = sig; err.unknownStatus = true; throw err; }
+      await sleep(2000); continue;
+    }
+    if (st && st.err) { const err = new Error(`${label} failed ${sig} ${JSON.stringify(st.err)}`); err.sig = sig; err.failedOnChain = true; throw err; }
+    if (st && (st.confirmationStatus === 'confirmed' || st.confirmationStatus === 'finalized')) break;
+    let bh = 0; try { bh = await conn.getBlockHeight('confirmed'); } catch { /* ignore */ }
+    if (bh > lastValidBlockHeight) { const st2 = (await conn.getSignatureStatuses([sig], { searchTransactionHistory: true })).value[0]; if (st2 && !st2.err && st2.confirmationStatus) break; const err = new Error(`Signature ${sig} has expired: block height exceeded.`); err.sig = sig; throw err; }
+    if (Date.now() - t0 > 180_000) { const err = new Error(`${label}: ${sig} not confirmed after 180 s`); err.sig = sig; err.unknownStatus = true; throw err; }
+    try { await conn.sendRawTransaction(raw, { skipPreflight: true, maxRetries: 0 }); } catch { /* already known / dropped: keep trying */ }
+    await sleep(1500);
+  }
+  return sig;
+}
+
+// H2 (review port from v2 live-bugfix): the position account is created by a tx we may lose track of (status poll 429, "expired" but landed, crash between send and saveState).
+// Before the first send the planned position is kept in state.pendingOpens (public key + plan, no secret); when openDeposit throws before the position was
+// recorded we look the account up and, if it exists, record and book it like a normal open. The reconcile adopts what is still unknown.
+function notifyTg(text) { try { const r = telegram.send(text); if (r && r.catch) r.catch(() => {}); } catch { /* notify is best effort */ } }
+async function accountExists(pk, tries = 3) {
+  for (let i = 0; i < tries; i++) { try { return !!(await conn.getAccountInfo(pk, 'confirmed')); } catch { await sleep(2500); } }
+  return null;   // unknown: RPC kept failing
+}
+async function openDepositTracked({ state, p, posKp, recordPosition, args }) {
+  const file = path.join(DIR, 'state.json');
+  recordPosition(); const draft = JSON.parse(JSON.stringify(state.position)); state.position = null;
+  const dropPending = () => { state.pendingOpens = (state.pendingOpens || []).filter(x => x.position !== draft.position); };
+  // While nothing is recorded, save WITHOUT dropping the position being worked on (a reposition's old leg stays in state until the new one exists, as before).
+  const saveKeep = () => { if (!state.position && state.__active) { state.position = state.__active; try { saveState(state, file); } finally { state.position = null; } } else saveState(state, file); };
+  dropPending(); state.pendingOpens.push({ position: draft.position, pool: p.address, name: p.name, at: now(), draft });
+  saveKeep();
+  try { const dep = await liveOpenExec.openDeposit(args); dropPending(); saveKeep(); return dep; }
+  catch (e) {
+    if (state.position || e.notSent) { dropPending(); saveKeep(); throw e; }
+    await sleep(3000);
+    const ex = await accountExists(posKp.publicKey);
+    if (ex === true) {
+      log(`  open ${p.name}: "${String(e.message).split('\n')[0]}" but position ${draft.position} exists on chain: recorded and booked from the chain`);
+      recordPosition(); dropPending(); saveState(state, file);
+      notifyTg(`⚠️ ${p.name}: open tx reported an error but the position exists on chain. It is now managed by the bot (SL/TP active).`);
+      return { complete: false, depositedLamports: 0, recovered: true };
+    }
+    if (ex === false) { dropPending(); saveKeep(); }
+    else log(`  open ${p.name}: position account unknown (RPC); kept as pending open, the reconcile adopts it if it exists`);
+    throw e;
+  }
+}
+async function onchainQuoteDeposit(dlmm, posKp) {
+  // quote side + any token side at the active price (a trade through the active bin in the 1.5 s turns part of the quote deposit into token: still deposited, not a shortfall)
+  try { await new Promise((r) => setTimeout(r, 1500)); const lb = await dlmm.getPosition(posKp.publicKey); const y = Number(lb.positionData.totalYAmount.toString()) / 10 ** dlmm.tokenY.mint.decimals, x = Number(lb.positionData.totalXAmount.toString()) / 10 ** dlmm.tokenX.mint.decimals;
+    if (!(x > 0)) return y; const active = await dlmm.getActiveBin(); const price = +dlmm.fromPricePerLamport(+active.price); return Number.isFinite(price) && price > 0 ? y + x * price : y; } catch { return null; }
+}
+const bookOnchainDeposit = (pos, dep, real, o = {}) => liveOpenExec.bookOnchainDeposit(pos, dep, real, { ...o, log });
+async function repairZeroDeposit(state, pos) {
+  try {
+    const dlmm = await dlmmFor(pos.pool, { fresh: true }), lb = await dlmm.getPosition(new PublicKey(pos.position)), active = await dlmm.getActiveBin();
+    const dX = 10 ** dlmm.tokenX.mint.decimals, dY = 10 ** dlmm.tokenY.mint.decimals, price = +dlmm.fromPricePerLamport(+active.price);
+    const real = Number(lb.positionData.totalYAmount.toString()) / dY + Number(lb.positionData.totalXAmount.toString()) / dX * price;
+    if (!(real > 0)) return false;
+    const isSol = pos.quoteMint !== USDC;
+    bookOnchainDeposit(pos, { complete: false, depositedLamports: 0 }, real, { unit: isSol ? LAMPORTS_PER_SOL : 1e6, quote: isSol ? 'SOL' : 'USDC' });
+    saveState(state, path.join(DIR, 'state.json'));
+    log(`  ${pos.name}: position holds ${real.toFixed(6)} ${isSol ? 'SOL' : 'USDC'} after all: booked, kept`);
+    return true;
+  } catch (e) { log(`  ${pos.name}: zero-deposit re-read failed (retry next poll): ${e.message}`); return false; }
+}
+// A position account that exists on chain but never got its deposit (first add failed): close it, get the rent back, forget it. Never booked as a trade.
+async function emptyLivePositionCleanup(state, pos) {
+  try {
+    const dlmm = await dlmmFor(pos.pool, { fresh: true });
+    const lb = await dlmm.getPosition(new PublicKey(pos.position));
+    const d = lb.positionData, hasLiq = (d.positionBinData || []).some((b) => Number(b.positionXAmount) > 0 || Number(b.positionYAmount) > 0);
+    if (hasLiq) { log(`  ${pos.name}: position has liquidity after all, keeping it`); return false; }
+    const tx = await dlmm.closePosition({ owner: wallet.publicKey, position: lb });
+    await send(tx, [wallet], 'close-empty-position');
+  } catch (e) { if (!/not found|does not exist|Account does not exist/i.test(String(e.message))) { log(`  empty position cleanup failed (retry next poll): ${e.message}`); return false; } }
+  state.positions = (state.positions || []).filter((x) => x !== pos && x.position !== pos.position); if (state.position === pos) state.position = null;
+  livePositions.syncPositions && livePositions.syncPositions(state);
+  saveState(state, path.join(DIR, 'state.json')); log(`  ${pos.name}: empty position closed, rent returned, nothing was booked`);
+  return true;
 }
 
 async function liveOpen(p, state, opts = {}) {
@@ -2099,12 +2202,14 @@ async function liveOpen(p, state, opts = {}) {
       baseFeePct: p.pool_config?.base_fee_pct ?? p.pool_config?.base_fee_percentage ?? null, strategySettings: opts.strategySettings || strategy.snapshot(CFG), openSource: opts.source || 'scan' };
     Object.assign(state.position, { spotSol: sizing.actual * plan.split, bidaskSol: sizing.actual * (1 - plan.split), upperBufferBins: plan.upper, nBins: plan.width, origMinBinId: minBinId, origMaxBinId: maxBinId, shape: 'open-' + String(CFG.OPEN_SHAPE || 'MIXED').toLowerCase() });
   };
-  const dep = await liveOpenExec.openDeposit({
+  const dep = await openDepositTracked({ state, p, posKp, recordPosition, args: {
     dlmm, plan, actualSol: sizing.actual, posKp, wallet, send, BN, StrategyType, lamports: LAMPORTS_PER_SOL, slippage: CFG.SLIPPAGE_PCT, log,
     onCreated: async ({ update }) => { if (!update) recordPosition(); saveState(state, path.join(DIR, 'state.json')); },
-  });
+  } });
+  // Review port (live-pnl-fix): book what the position REALLY holds; SOL that never reached the position stays its pile (leftoverSol).
+  bookOnchainDeposit(state.position, dep, await onchainQuoteDeposit(dlmm, posKp), { unit: LAMPORTS_PER_SOL, quote: 'SOL' });
+  if (!(dep.depositedLamports > 0)) { const pos0 = state.position; const gone = await emptyLivePositionCleanup(state, pos0); if (gone || !state.position || !(await repairZeroDeposit(state, state.position))) return { opened: false, skipped: gone ? 'deposit failed: empty position closed' : 'deposit failed: empty position cleanup retried next poll' }; dep.depositedLamports = Math.round(state.position.depositSol * LAMPORTS_PER_SOL); }
   if (dep.complete) state.position.stage = 'full';
-  else { state.position.depositSol = dep.depositedLamports / LAMPORTS_PER_SOL; state.position.spotSol = Math.min(state.position.spotSol, state.position.depositSol); state.position.bidaskSol = Math.max(0, state.position.depositSol - state.position.spotSol); }
   saveState(state, path.join(DIR, 'state.json'));
   return { opened: true, complete: dep.complete, width: plan.width, wide: plan.wide };
 }
@@ -2135,23 +2240,38 @@ async function liveOpenUsdcPool({ p, state, opts, policy, dlmm, active, binStep,
       baseFeePct: p.pool_config?.base_fee_pct ?? p.pool_config?.base_fee_percentage ?? null, strategySettings: opts.strategySettings || strategy.snapshot(CFG), openSource: opts.source || 'scan' };
     Object.assign(state.position, { spotQuote: pl.depositQuote * plan.split, bidaskQuote: pl.depositQuote * (1 - plan.split), upperBufferBins: plan.upper, nBins: plan.width, origMinBinId: minBinId, origMaxBinId: maxBinId, shape: 'open-' + String(policy.OPEN_SHAPE || 'MIXED').toLowerCase() });
   };
-  const dep = await liveOpenExec.openDeposit({ dlmm, plan, actualSol: pl.depositQuote, posKp, wallet, send, BN, StrategyType, lamports: 1e6, slippage: CFG.SLIPPAGE_PCT, log,
-    onCreated: async ({ update }) => { if (!update) recordPosition(); saveState(state, path.join(DIR, 'state.json')); } });
+  const dep = await openDepositTracked({ state, p, posKp, recordPosition, args: { dlmm, plan, actualSol: pl.depositQuote, posKp, wallet, send, BN, StrategyType, lamports: 1e6, slippage: CFG.SLIPPAGE_PCT, log,
+    onCreated: async ({ update }) => { if (!update) recordPosition(); saveState(state, path.join(DIR, 'state.json')); } } });
+  bookOnchainDeposit(state.position, dep, await onchainQuoteDeposit(dlmm, posKp), { unit: 1e6, quote: 'USDC' });   // review port (live-pnl-fix): same on-chain booking as the SOL path
+  if (!(dep.depositedLamports > 0)) { const pos0 = state.position; const gone = await emptyLivePositionCleanup(state, pos0); if (gone || !state.position || !(await repairZeroDeposit(state, state.position))) return { opened: false, skipped: gone ? 'deposit failed: empty position closed' : 'deposit failed: empty position cleanup retried next poll' }; dep.depositedLamports = Math.round(state.position.depositSol * 1e6); }
   if (dep.complete) state.position.stage = 'full';
-  else { state.position.depositSol = dep.depositedLamports / 1e6; state.position.depositQuote = state.position.depositSol; }
   saveState(state, path.join(DIR, 'state.json'));
   return { opened: true, complete: dep.complete, usdcPool: true, width: plan.width, wide: plan.wide };
 }
 
 async function liveValuation(pos) {
-  const dlmm = await DLMM.create(conn, new PublicKey(pos.pool));
+  const dlmm = await dlmmFor(pos.pool);
   const p = await dlmm.getPosition(new PublicKey(pos.position));
   const active = await dlmm.getActiveBin();
   const price = +dlmm.fromPricePerLamport(+active.price);
   const dX = 10 ** dlmm.tokenX.mint.decimals, dY = 10 ** dlmm.tokenY.mint.decimals, d = p.positionData;   // quote decimals: 9 for SOL pools, 6 for USDC pools
-  const x = +d.totalXAmount / dX, y = +d.totalYAmount / dY, fx = +d.feeX.toString() / dX, fy = +d.feeY.toString() / dY;
-  const value = y + x * price + fy + fx * price;
-  return { dlmm, p, price, x, y, fx, fy, fees: fy + fx * price, value, pnl: value / pos.depositSol - 1, activeBinId: active.binId, inRange: active.binId >= d.lowerBinId && active.binId <= d.upperBinId };
+  let x = +d.totalXAmount / dX;
+  const y = +d.totalYAmount / dY, fx = +d.feeX.toString() / dX, fy = +d.feeY.toString() / dY;
+  // Tokens of THIS position that sit in the wallet (withdrawn by a reshape / interrupted close, not yet re-added or sold) still belong to it. Without them the position looks like a ~30% loss and the exit rules close it for nothing.
+  // M1 (live-bugfix): only tokens THIS position put in the wallet count (pos.walletTokenRaw + what an interrupted close withdrew), never stray tokens of the same mint
+  // (an unsold leftover of an earlier trade, an airdrop, the owner's own bag) that used to fake a TP. Positions from before the fix keep the old full-balance rule.
+  const legacy = pos.walletTokenRaw == null;
+  const owned = BigInt(pos.walletTokenRaw || 0);
+  if (legacy || owned > 0n || pos.closeWalletTokenBefore != null || pos.closePosTokenRaw != null) {
+    try { const { raw } = await walletTokenRawOf(pos.mintX); x += Number(legacy ? raw : liveSafety.ownedWalletTokenRaw(pos, raw)) / dX; }
+    catch { if (!legacy && owned > 0n) x += Number(owned) / dX; /* RPC hiccup: the tokens we know we own are still ours */ }
+  }
+  const fees = fy + fx * price, principal = y + x * price;
+  // 21 Nov 2026 (operator): a manual / external add is capital, not profit. Sync the basis BEFORE PnL so
+  // the same poll cannot fire a false TP/SL (tonight's DCTY closed on a fake +100%).
+  const externalCapital = liveOpenExec.syncExternalCapital(pos, { x, y, price, principal, quote: pos.quoteSymbol || (pos.quoteMint === USDC ? 'USDC' : 'SOL') }, { log });
+  const value = principal + fees, basis = Number(pos.depositSol) || 0;
+  return { dlmm, p, price, x, y, fx, fy, fees, value, pnl: basis > 0 ? value / basis - 1 : 0, activeBinId: active.binId, inRange: active.binId >= d.lowerBinId && active.binId <= d.upperBinId, externalCapital };
 }
 
 
@@ -2164,12 +2284,10 @@ async function liveSwapAllToSol(mintX) {
   if(!q.ok)throw Error('Jupiter token close quote failed: '+q.error);
   log(`  jupiter quote: ${amt} raw token -> ${(+q.outAmount / 1e9).toFixed(5)} SOL, impact=${q.priceImpactPct}`);
   if (CFG.DRY_RUN || CFG.PAPER || process.env.LIVE_CONFIRMED !== '1') return;
-  const s = await jupGetJSON('https://lite-api.jup.ag/swap/v1/swap', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ quoteResponse: q, ...swapRoute.swapBodyParams(q), userPublicKey: wallet.publicKey.toBase58(), wrapAndUnwrapSol: true, dynamicComputeUnitLimit: true, prioritizationFeeLamports: 'auto' }) });
+  const s = await jupGetJSON('https://lite-api.jup.ag/swap/v1/swap', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ quoteResponse: { ...q, inAmount: String(q.inAmount), outAmount: String(q.outAmount) },   /* parseQuote turned the amounts into numbers: the Jupiter API answers 422 unless they are strings */ ...swapRoute.swapBodyParams(q), userPublicKey: wallet.publicKey.toBase58(), wrapAndUnwrapSol: true, dynamicComputeUnitLimit: true, prioritizationFeeLamports: 'auto' }) });
   const vtx = VersionedTransaction.deserialize(Buffer.from(s.swapTransaction, 'base64')); vtx.sign([wallet]);
-  const { blockhash, lastValidBlockHeight } = await conn.getLatestBlockhash();
-  const sig = await conn.sendRawTransaction(vtx.serialize(), { maxRetries: 5 });
-  const c = await conn.confirmTransaction({ signature: sig, blockhash, lastValidBlockHeight }, 'confirmed');
-  if (c.value.err) throw new Error('jupiter swap failed ' + sig); log('  tx jupiter-swap confirmed ' + sig);
+  const sig = await sendSwapTx(vtx, s, 'jupiter-swap');   // review fix: robust confirm (was a single confirmTransaction)
+  if (sig && sig.notLanded) throw new Error('jupiter swap failed ' + sig.sig + ': ' + sig.reason); log('  tx jupiter-swap confirmed ' + sig);
   try {
     for (const a of accs.value) {
       const tx = new Transaction().add(createCloseAccountInstruction(a.pubkey, wallet.publicKey, wallet.publicKey, [], a.account.owner));
@@ -2178,41 +2296,116 @@ async function liveSwapAllToSol(mintX) {
   } catch (e) { log('  close ATA skipped: ' + e.message); }
 }
 
+async function emptyPositionCloseTxs(v) {
+  const out = [];
+  if (Number(v.p.positionData.feeX) > 0 || Number(v.p.positionData.feeY) > 0) { try { const t = await v.dlmm.claimSwapFee({ owner: wallet.publicKey, position: v.p }); out.push(...(Array.isArray(t) ? t : [t])); } catch (e) { if (!/No fee to claim/i.test(e.message)) throw e; } }
+  out.push(await v.dlmm.closePosition({ owner: wallet.publicKey, position: v.p }));
+  return out;
+}
 async function liveClose(state, reason, opts = {}) {
   const pos = state.position;
+  // Never funded (depositSol 0) and not mid-close: nothing to book, just give the rent back (live-pnl-fix; was a 'binId' TypeError loop).
+  if (!(Number(pos.depositSol) > 0) && pos.closeStartSol == null) { log(`CLOSE ${pos.name} reason=${reason}: position was never funded, empty cleanup only`); if (CFG.DRY_RUN || CFG.PAPER) throw new Error('liveClose called in dry/paper'); await emptyLivePositionCleanup(state, pos); return { empty: true, solOut: 0, usdcOut: 0 }; }
   const v = await liveValuation(pos);
   log(`CLOSE ${pos.name} reason=${reason} pnl=${(v.pnl * 100).toFixed(2)}% value=${v.value.toFixed(4)} SOL`);
   if (CFG.DRY_RUN || CFG.PAPER) throw new Error('liveClose called in dry/paper');
-  const solBeforeRemove = await realSolBal(wallet.publicKey);
-  const txs = await v.dlmm.removeLiquidity({ user: wallet.publicKey, position: new PublicKey(pos.position), fromBinId: v.p.positionData.lowerBinId, toBinId: v.p.positionData.upperBinId, bps: new BN(10000), shouldClaimAndClose: true });
-  for (const [i, tx] of txs.entries()) await send(tx, [wallet], `remove-claim-close ${i + 1}/${txs.length}`);
+  // A close can be interrupted (expired signature after the first remove tx): the wallet SOL is measured from the FIRST attempt and the reason is kept, so a half-closed position is neither mis-booked nor judged by the exit rules.
+  if (pos.closeStartSol == null) {
+    pos.closeStartSol = await realSolBal(wallet.publicKey); pos.closePendingReason = reason; pos.closeSigs = [];
+    pos.closeEstimate = { pnl: v.pnl, value: v.value, fees: v.fees, price: v.price, at: now() };   // H1: what the books use if the close has to be finished without the position account
+    if (pos.walletTokenRaw != null) {   // M1: the wallet's token balance BEFORE the remove; everything above it after the remove is this position's
+      try { pos.closeWalletTokenBefore = String((await walletTokenRawOf(pos.mintX)).raw); }
+      catch { const d = v.p.positionData; pos.closePosTokenRaw = String(BigInt(Math.floor((+d.totalXAmount || 0) + (+String(d.feeX) || 0)))); }
+    }
+    saveState(state, path.join(DIR, 'state.json'));
+  }
+  // live-pnl-fix: removeLiquidity on a position without liquidity throws "reading 'binId'" in the SDK. Empty -> claim what is left (fees) and close the account instead.
+  const liqLeft = (v.p.positionData.positionBinData || []).some((b) => Number(b.positionXAmount) > 0 || Number(b.positionYAmount) > 0);
+  const txs = liqLeft ? await v.dlmm.removeLiquidity({ user: wallet.publicKey, position: new PublicKey(pos.position), fromBinId: v.p.positionData.lowerBinId, toBinId: v.p.positionData.upperBinId, bps: new BN(10000), shouldClaimAndClose: true }) : await emptyPositionCloseTxs(v);
+  if (!liqLeft) log(`  ${pos.name}: no liquidity left in the position, closing the account only (${txs.length} tx)`);
+  pos.closeSigs = pos.closeSigs || [];
+  for (const [i, tx] of txs.entries()) await send(tx, [wallet], `remove-claim-close ${i + 1}/${txs.length}`, { onSig: sig => { pos.closeSigs.push(sig); saveState(state, path.join(DIR, 'state.json')); } });
   await sleep(3000);
-  const receivedSol = (await realSolBal(wallet.publicKey)) - solBeforeRemove;   // quote side (SOL pools) + refunded rent - close fees
+  return finishLiveClose(state, pos, reason, opts, v);
+}
+
+// M2 (live-bugfix): SOL our own close txs moved (fee payer balance pre/post, per tx), so another position's SOL, a deposit or a withdrawal landing between
+// the first close attempt and the booking is never counted as this trade. null = could not read every tx (caller falls back to the wallet delta).
+async function closeSigsLamports(sigs) {
+  if (!Array.isArray(sigs) || !sigs.length) return null;
+  let sum = 0;
+  for (const sig of sigs) {
+    let tx = null;
+    for (let k = 0; k < 4 && !tx; k++) { try { tx = await conn.getTransaction(sig, { commitment: 'confirmed', maxSupportedTransactionVersion: 0 }); } catch { /* retry */ } if (!tx) await sleep(1500); }
+    if (!tx) { let st; try { st = (await conn.getSignatureStatuses([sig], { searchTransactionHistory: true })).value[0]; } catch { return null; } if (st) return null; continue; }   // never landed: moved nothing
+    const d = liveSafety.lamportDelta(tx); if (d == null) return null; sum += d;   // a failed tx still paid its fee: counted too
+  }
+  return sum / LAMPORTS_PER_SOL;
+}
+function clearCloseMarks(pos) { for (const k of ['closeStartSol', 'closePendingReason', 'closeSigs', 'closeEstimate', 'closeWalletTokenBefore', 'closePosTokenRaw', 'closeReceivedSol', 'closeSwapBack', 'missingPolls']) delete pos[k]; }
+// Tokens of this position in the wallet (M1): reshape tokens + what the remove returned. Legacy positions (no walletTokenRaw) keep the old "whole balance" rule.
+async function ownTokenForSale(pos) {
+  const accs = await conn.getParsedTokenAccountsByOwner(wallet.publicKey, { mint: new PublicKey(pos.mintX) });
+  const total = accs.value.reduce((t, a) => t + BigInt(a.account.data.parsed.info.tokenAmount.amount), 0n);
+  const raw = pos.walletTokenRaw == null ? total : liveSafety.ownedWalletTokenRaw(pos, total);
+  return { raw, total, partial: raw < total, decimals: accs.value[0]?.account.data.parsed.info.tokenAmount.decimals ?? pos.decX, accounts: accs.value };
+}
+async function closeTokenAccountsIfEmpty(tok) { if (tok.partial) return; for (const a of tok.accounts) await send(new Transaction().add(createCloseAccountInstruction(a.pubkey, wallet.publicKey, wallet.publicKey, [], a.account.owner)), [wallet], 'close-ata'); }
+
+// Second half of a close, after the remove/claim/close txs landed. Also used to finish a close whose position account is already gone (H1).
+async function finishLiveClose(state, pos, reason, opts, v) {
+  if (pos.closeReceivedSol == null) {
+    const solBeforeRemove = pos.closeStartSol;
+    const walletRecv = (await realSolBal(wallet.publicKey)) - solBeforeRemove;   // old rule: quote side + refunded rent - close fees, from the wallet
+    const metaRecv = await closeSigsLamports(pos.closeSigs);
+    if (metaRecv != null && Math.abs(metaRecv - walletRecv) > 0.0005) log(`  close txs returned ${metaRecv.toFixed(6)} SOL, wallet moved ${walletRecv.toFixed(6)} SOL since the close started: booking the tx amounts`);
+    pos.closeReceivedSol = metaRecv != null ? metaRecv : walletRecv;
+    saveState(state, path.join(DIR, 'state.json'));
+  }
+  const receivedSol = pos.closeReceivedSol;
   // Swap back exactly like the dry run (paper-usdc.exitQuote): token -> USDC directly, then the position's whole SOL pile -> USDC.
-  const sb = await liveCloseExec.swapBack({
-    pos, sleep, log, pileSol: (pos.quoteMint === USDC ? 0 : 0) + Math.max(0, (pos.leftoverSol || 0) + receivedSol),
-    getUsdcBalance: () => liveUsdcBal(wallet.publicKey),
-    getSolBalance: () => realSolBal(wallet.publicKey),
-    getToken: async () => { const accs = await conn.getParsedTokenAccountsByOwner(wallet.publicKey, { mint: new PublicKey(pos.mintX) }); const raw = accs.value.reduce((t, a) => t + BigInt(a.account.data.parsed.info.tokenAmount.amount), 0n); return { raw, decimals: accs.value[0]?.account.data.parsed.info.tokenAmount.decimals ?? pos.decX, accounts: accs.value }; },
-    swapTokenToUsdc: (raw, dec) => jupiterSwapLive(pos.mintX, USDC, raw, dec, 6, 'token-to-usdc-close'),
-    swapSolToUsdc: raw => jupiterSwapLive(SOL, USDC, raw, 9, 6, 'sol-pile-to-usdc-close'),
-    closeTokenAccounts: async tok => { for (const a of tok.accounts) await send(new Transaction().add(createCloseAccountInstruction(a.pubkey, wallet.publicKey, wallet.publicKey, [], a.account.owner)), [wallet], 'close-ata'); },
-  });
-  if (!sb.complete) log('  ERROR swap back incomplete, leftover stays in the wallet: ' + sb.errors.join(' | '));
+  // Review fix (24 Nov 2026): the swap-back result is saved once (pos.closeSwapBack). Any throw after the swaps (an adopted position
+  // has walletBefore null and the log line threw) left the close pending; the next poll found the account gone, ran this function
+  // again and sold the saved SOL pile a second time from the wallet, every poll. A resumed close now books the saved result.
+  let lastTok = null, sb, pendingTokenEstimateUsdc = 0;
+  if (pos.closeSwapBack) {
+    ({ sb, pendingTokenEstimateUsdc = 0 } = pos.closeSwapBack); sb = { ...sb, errors: [...(sb.errors || [])] };
+    log('  swap-back already done by the interrupted close: booked from the saved result, nothing sold again');
+  } else {
+    sb = await liveCloseExec.swapBack({
+      pos, sleep, log, pileSol: (pos.quoteMint === USDC ? 0 : 0) + Math.max(0, (pos.leftoverSol || 0) + receivedSol),
+      getUsdcBalance: () => liveUsdcBal(wallet.publicKey),
+      getSolBalance: () => realSolBal(wallet.publicKey),
+      getToken: async () => (lastTok = await ownTokenForSale(pos)),
+      swapTokenToUsdc: (raw, dec) => jupiterSwapLive(pos.mintX, USDC, raw, dec, 6, 'token-to-usdc-close'),
+      swapSolToUsdc: raw => jupiterSwapLive(SOL, USDC, raw, 9, 6, 'sol-pile-to-usdc-close'),
+      closeTokenAccounts: closeTokenAccountsIfEmpty,
+      // SWEEP: no other open position shares this mint, so any token left of it is dust from an earlier close and is safe to sell too.
+      canSweepStray: async () => !(livePositions.list(state) || []).some(x => x.mintX === pos.mintX && String(x.position) !== String(pos.position)),
+    });
+    // USDC capital: unsold tokens are retried to USDC (not SOL) and booked meanwhile at the close price - 1% (like the SOL path, M3), corrected when sold.
+    if (!sb.complete) {
+      log('  ERROR swap back incomplete, leftover stays in the wallet (retried every cycle until sold): ' + sb.errors.join(' | '));
+      const ownedRaw = lastTok ? lastTok.raw : 0n, dec = lastTok ? lastTok.decimals : pos.decX;
+      if (!(sb.tokenSwapped > 0) && ownedRaw > 0n && v.price > 0) { const qUsd = pos.quoteMint === USDC ? 1 : await solUsd().catch(() => 0); pendingTokenEstimateUsdc = Number(ownedRaw) / 10 ** dec * v.price * qUsd * 0.99; }
+      (state.pendingSells = state.pendingSells || []).push({ mint: pos.mintX, dec: pos.decX, name: pos.name, at: now(), to: 'USDC', ...(lastTok && pos.walletTokenRaw != null ? { ownedRaw: String(lastTok.raw) } : {}), row: { position: pos.position, closedAt: null }, estimateUsdc: pendingTokenEstimateUsdc });
+    }
+    if (pendingTokenEstimateUsdc > 0) sb.usdcOut += pendingTokenEstimateUsdc;
+    pos.closeSwapBack = { sb, pendingTokenEstimateUsdc }; saveState(state, path.join(DIR, 'state.json'));
+  }
   const after = await realSolBal(wallet.publicKey);
   const afterUsdc = sb.usdcAfter;
-  const realized = after - pos.walletBefore;
+  const realized = Number.isFinite(pos.walletBefore) ? after - pos.walletBefore : 0;   // adopted positions have no walletBefore
   const basisUsdc = pos.initialUsdcIn || pos.usdcIn, pnlUsd = sb.usdcOut - basisUsdc, pnlPct = basisUsdc > 0 ? 100 * pnlUsd / basisUsdc : 0;   // same definition as paperClose
-  log(`  USDC out ${sb.usdcOut.toFixed(4)} for ${basisUsdc.toFixed(4)} in: ${pnlUsd.toFixed(4)} USDC (${pnlPct.toFixed(3)}%); wallet SOL back to ${after.toFixed(4)} (was ${pos.walletBefore.toFixed(4)} before the position)`);
+  log(`  USDC out ${sb.usdcOut.toFixed(4)} for ${basisUsdc.toFixed(4)} in: ${pnlUsd.toFixed(4)} USDC (${pnlPct.toFixed(3)}%); wallet SOL back to ${after.toFixed(4)} (was ${Number.isFinite(pos.walletBefore) ? pos.walletBefore.toFixed(4) : '?'} before the position)`);
   // SL blacklist: record every stop-loss close by token mint, exactly like paperClose (the rule controls skipping at screening/open).
   if (!opts.intermediate && slBlacklist.isStopLoss(reason)) { try { if (slBlacklist.add(PAPER_DIR, { mint: pos.mintX, symbol: pos.name, pool: pos.pool, reason, closedAt: now(), source: 'auto' })) log('SL blacklist add ' + pos.name + ' ' + pos.mintX); } catch (e) { log('SL blacklist add failed: ' + e.message); } }
   const row = { ...pos, closedAt: now(), reason, estPnlPct: +(v.pnl * 100).toFixed(2), estValueSol: +v.value.toFixed(5), feesSol: +v.fees.toFixed(5), realizedSol: +realized.toFixed(5), usdcIn: basisUsdc, usdcOut: sb.usdcOut, legUsdcIn: pos.usdcIn, legUsdcOut: sb.usdcOut, pnlUsd, pnlPct, netPnlUsd: pnlUsd, netPnlPct: pnlPct, pnlCapital: pnlUsd, pnlCapitalPct: pnlPct, solPile: sb.solPile, swapBackComplete: sb.complete, swapBackErrors: sb.errors };
-  // Item 1 (§3.1.7): an exit taken on an on-chain estimate is flagged in the
-  // history row (quoted=false + valuationBasis) and in the log line. The
-  // Telegram flag rides on Item 4a's live close call site, which reads
-  // row.quoted (v1 liveClose has no notify call today — OPEN-4). The halt
-  // accounting below runs for real closed legs only; intermediate
-  // reposition legs are excluded (the final close carries the leg PnL).
+  clearCloseMarks(row);
+  // Item 1 (§3.1.7 + K1/K3-K8): flag on-chain-estimate exits in the row
+  // (v1 has no live close notify yet: OPEN-4; the flag is in the history row)
+  // and feed the close into the halt accounting. Intermediate reposition
+  // legs are excluded (the final close carries the leg PnL).
   if (opts.valuation) { row.quoted = !!opts.valuation.quoted; row.valuationBasis = opts.valuation.basis || null; if (!opts.valuation.quoted) log(`  CLOSE ${pos.name}: exit on on-chain estimate (quoted=false, basis=${row.valuationBasis}) — flagged in history row`); }
   if (!opts.intermediate) {
     // Item 1 (N2 fix): never skip halt accounting for a missing price.
@@ -2230,8 +2423,9 @@ async function liveClose(state, reason, opts = {}) {
     // systematic positive bias of leftoverSol + rent refund against a
     // 0.0625 SOL threshold. Close fees inside receivedSol stay in (they
     // shrink the gap slightly — the safe direction). No gap observation
-    // when the swap-back is incomplete (partial fills are not a
-    // quote-vs-fill observation) or when no price exists.
+    // when the swap-back is incomplete (partial fills — and the
+    // pending-token estimate added to sb.usdcOut — are not a quote-vs-fill
+    // observation) or when no price exists.
     const pxHalt = (await solUsd().catch(() => 0)) || halt.lastSolUsdPx() || 0;
     const priceFallback = pxHalt === 0 || (Date.now() - solUsdCache.t >= 60_000);
     if (priceFallback) { row.priceFallback = true; log(`  CLOSE ${pos.name}: halt accounting on ${pxHalt === 0 ? 'NO SOL/USD price ever seen (pnlSol booked as 0 — leg still counted)' : 'fallback SOL price $' + pxHalt.toFixed(2)} — row flagged priceFallback`); }
@@ -2240,10 +2434,45 @@ async function liveClose(state, reason, opts = {}) {
       ? { quotedSol: pos.quoteMint === USDC ? v.value / pxHalt : v.value, realisedSol: sb.usdcOut / pxHalt - pileOutsideSol }
       : { quotedSol: null, realisedSol: null };
     halt.recordClose({ pnlSol: pxHalt > 0 ? pnlUsd / pxHalt : 0, legSol: pxHalt > 0 ? (pos.quoteMint === USDC ? (pos.depositQuote ?? pos.usdcIn ?? 0) / pxHalt : (pos.depositSol || 0)) : undefined, reason, pool: pos.pool, openedAt: pos.openedAt, quotedSol: gap.quotedSol, realisedSol: gap.realisedSol, feeBps: swapRoute.ROUTE_FEE_BPS });
-    state.history.push(row); state.position = null; saveState(state, path.join(DIR, 'state.json'));
   }
-  log(`  closed${opts.intermediate ? ' (reposition leg)' : ''}. wallet ${after.toFixed(4)} SOL, USDC ${afterUsdc.toFixed(2)}`);
+  // Review fix: the close marks (incl. the saved swap-back result) are cleared only now, so a throw above leaves the close resumable.
+  clearCloseMarks(pos);
+  if (pendingTokenEstimateUsdc > 0) { row.pendingTokenEstimateUsdc = pendingTokenEstimateUsdc; row.swapBackEstimated = true; const ps = state.pendingSells[state.pendingSells.length - 1]; if (ps && ps.row) ps.row.closedAt = row.closedAt; }
+  if (!opts.intermediate) { state.history.push(row); state.position = null; saveState(state, path.join(DIR, 'state.json')); }
+  log(`  closed${opts.intermediate ? ' (reposition leg)' : ''}. wallet ${after.toFixed(4)} SOL, USDC ${afterUsdc.toFixed(2)}${pendingTokenEstimateUsdc > 0 ? `; unsold token booked at ~${pendingTokenEstimateUsdc.toFixed(2)} USDC until sold` : ''}`);
   return { usdcOut: sb.usdcOut, row };
+}
+
+// H1: the close txs landed (position account closed) but the booking was interrupted: book it from the recorded close txs, sell this position's tokens.
+async function finishGhostClose(state, pos) {
+  const e = pos.closeEstimate || pos.lastValuation || { pnl: 0, value: pos.depositSol, fees: 0, price: pos.lastPrice || 0 };
+  const v = { pnl: Number(e.pnl) || 0, value: Number(e.value) || 0, fees: Number(e.fees) || 0, price: Number(e.price) || Number(pos.lastPrice) || 0 };
+  if (pos.closeStartSol == null) pos.closeStartSol = await realSolBal(wallet.publicKey);
+  const r = await finishLiveClose(state, pos, pos.closePendingReason, {}, v);
+  notifyTg(`ℹ️ ${pos.name}: an interrupted close was finished and booked (position account already closed on chain).`);
+  return r;
+}// H1: the position account vanished without a close by the bot (closed by hand in the same wallet): it is no longer managed. Booked at its last known value
+// (flagged as an estimate), nothing is sold, the owner is told.
+async function bookClosedOutside(state, pos) {
+  const lv = pos.lastValuation || { value: pos.depositSol, pnl: 0, fees: 0 };
+  const px = await solUsd().catch(() => 0);
+  const row = { ...pos, closedAt: now(), reason: 'closed_outside_bot', estimated: true, estPnlPct: +((Number(lv.pnl) || 0) * 100).toFixed(2), estValueSol: +(Number(lv.value) || 0).toFixed(5), feesSol: +(Number(lv.fees) || 0).toFixed(5) };
+  if (pos.capitalAsset === 'SOL') {
+    const capIn = pos.capitalInSol, basisSol = pos.initialCapitalInSol || capIn, solOut = Math.max(0, (pos.leftoverSol || 0) + (Number(lv.value) || 0) + (pos.rentRefundableSol || 0));
+    const pnlCapital = solOut - capIn + (pos.realizedPnlCarrySol || 0), pnlPct = basisSol > 0 ? 100 * pnlCapital / basisSol : 0;
+    Object.assign(row, { solOut, solPile: solOut, realizedSol: +(solOut - capIn).toFixed(5), pnlCapital, pnlCapitalPct: pnlPct, pnlPct, netPnlPct: pnlPct, netPnlSol: pnlCapital, solUsd: px, pnlUsd: pnlCapital * px, netPnlUsd: pnlCapital * px });
+  } else {
+    // Review fix (24 Nov 2026): USDC capital had no result fields (usdcOut / pnlUsd), so stats read the row as a zero trade. Estimate:
+    // last value (quote USDC, or SOL at the SOL price) + the position's SOL pile and refundable rent at the SOL price.
+    const quoteUsd = pos.quoteMint === USDC ? 1 : px, basisUsdc = pos.initialUsdcIn || pos.usdcIn || 0;
+    const usdcOut = (Number(lv.value) || 0) * quoteUsd + ((pos.leftoverSol || 0) + (pos.rentRefundableSol || 0)) * px;
+    const pnlUsd = usdcOut - basisUsdc, pnlPct = basisUsdc > 0 ? 100 * pnlUsd / basisUsdc : 0;
+    Object.assign(row, { usdcIn: basisUsdc, usdcOut, legUsdcOut: usdcOut, pnlUsd, pnlPct, netPnlUsd: pnlUsd, netPnlPct: pnlPct, pnlCapital: pnlUsd, pnlCapitalPct: pnlPct, solUsd: px });
+  }
+  clearCloseMarks(row); delete row.liveBins;
+  state.history.push(row); state.position = null; saveState(state, path.join(DIR, 'state.json'));
+  log(`  ${pos.name}: position account closed outside the bot: removed from management, booked at its last value (estimate)`);
+  notifyTg(`⚠️ ${pos.name}: the position was closed outside the bot (account gone on chain). Removed from management and booked at its last known value (estimate). Tokens in the wallet were not sold.`);
 }
 
 // ---------- status ----------
@@ -2262,7 +2491,7 @@ async function writeLiveStatusPointer(state, extra = {}) {
     wallet: REAL_WALLET,
     solBalance: bal,
     solBalanceNote: 'on-chain balance of the bot wallet (read-only)',
-    rpc: CFG.RPC.replace(/\?.*/, '?…'),
+    rpc: (() => { try { return new URL(CFG.RPC).host; } catch { return '?'; } })(),   // host only: some RPC URLs carry the key in the path
     config: {
       ...(root.config || {}),
       positionSol: CFG.POSITION_SOL, positionUsd: CFG.POSITION_USD || null,
@@ -2290,6 +2519,7 @@ async function writeLiveStatusPointer(state, extra = {}) {
   // never let paper overwrite live trade history
   if (root.closedTrades) next.closedTrades = root.closedTrades;
   if (!CFG.PAPER) { const ps = livePositions.list(state); next.positions = ps; if (root.position || ps.length) next.position = ps[0] || null; }
+  try { next.rpcSlots = require('./rpc-config').slotStatus(); } catch { /* status only */ }   // hosts + state only, never the URL/key
   fs.writeFileSync(path.join(DIR, 'status.json'), JSON.stringify(next, null, 2));
 }
 
@@ -2336,10 +2566,31 @@ async function liveUsdcBal(pk) {
   return Number(raw) / 1e6;
 }
 
-async function jupiterSwapLive(inputMint, outputMint, rawAmount, inDec, outDec, label) {
+// Review fix (24 Nov 2026): send a signed Jupiter swap through the send() confirm loop (re-broadcast + status poll + history check).
+// The blockhash is Jupiter's, so its lastValidBlockHeight comes from the /swap answer; the fetched height is only a fallback (a later
+// height just waits longer, the history check still decides). A failed simulation or an on-chain error is returned as { notLanded }
+// (nothing moved);
+// an unknown status still throws with err.sig, so the caller re-reads the balance before any retry (live-close-exec maybeSent).
+async function sendSwapTx(vtx, swapAnswer, label) {
+  if (CFG.PAPER || CFG.DRY_RUN || process.env.LIVE_CONFIRMED !== '1') throw new Error('sendSwapTx() blocked: paper/dry-run or LIVE_CONFIRMED missing');
+  let lvbh = Number(swapAnswer && swapAnswer.lastValidBlockHeight);
+  if (!(lvbh > 0)) lvbh = (await conn.getLatestBlockhash()).lastValidBlockHeight;
+  const raw = vtx.serialize();
+  const sig = bs58.encode(vtx.signatures[0]);
+  try { await conn.sendRawTransaction(raw, { maxRetries: 5 }); }
+  catch (e) {
+    // A failed simulation (slippage, no funds) means the RPC did not forward the transaction: nothing moved, report it now.
+    if (/simulation failed|preflight/i.test(String(e && e.message))) return { notLanded: true, sig, reason: e.message };
+    log(`  ${label}: first send failed (${e.message}); polling ${sig}`);   // a network error may still have forwarded it
+  }
+  try { await confirmRaw(raw, sig, label, lvbh); }
+  catch (e) { if (e.failedOnChain) return { notLanded: true, sig, reason: e.message }; e.sig = e.sig || sig; throw e; }
+  return sig;
+}
+async function jupiterSwapLive(inputMint, outputMint, rawAmount, inDec, outDec, label, slippageBps = 300) {
   const raw = typeof rawAmount === 'bigint' ? rawAmount : BigInt(Math.max(0, Math.floor(Number(rawAmount) || 0)));
   if (raw === 0n) return { ok: true, skipped: 'zero', inUi: 0, outUi: 0 };
-  const q = await jupiterQuote(inputMint, outputMint, raw, inDec, outDec);
+  const q = await jupiterQuote(inputMint, outputMint, raw, inDec, outDec, slippageBps);
   if (!q.ok) return { ok: false, error: q.error };
   log(`  jupiter ${label}: ${q.inUi} -> ${q.outUi} (quote)`);
   { const fee = halt.checkFeeBps(swapRoute.ROUTE_FEE_BPS, `swap:${label}`); if (!fee.ok) return { ok: false, error: fee.reason }; }   // Item 1 (K8): fee check at execution, before any swap is sent
@@ -2350,7 +2601,7 @@ async function jupiterSwapLive(inputMint, outputMint, rawAmount, inDec, outDec, 
     method: 'POST',
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify({
-      quoteResponse: q,
+      quoteResponse: { ...q, inAmount: String(q.inAmount), outAmount: String(q.outAmount) },   /* parseQuote turned the amounts into numbers: the Jupiter API answers 422 unless they are strings */
       ...swapRoute.swapBodyParams(q),
       userPublicKey: wallet.publicKey.toBase58(),
       wrapAndUnwrapSol: true,
@@ -2360,23 +2611,36 @@ async function jupiterSwapLive(inputMint, outputMint, rawAmount, inDec, outDec, 
   });
   const vtx = VersionedTransaction.deserialize(Buffer.from(s.swapTransaction, 'base64'));
   vtx.sign([wallet]);
-  const { blockhash, lastValidBlockHeight } = await conn.getLatestBlockhash();
-  const sig = await conn.sendRawTransaction(vtx.serialize(), { maxRetries: 5 });
-  const c = await conn.confirmTransaction({ signature: sig, blockhash, lastValidBlockHeight }, 'confirmed');
-  if (c.value.err) throw new Error(`${label} swap failed`);
+  const sig = await sendSwapTx(vtx, s, `jupiter-${label}`);
+  if (sig && sig.notLanded) return { ok: false, error: `${label} swap not landed: ${sig.reason}`, sig: sig.sig };   // nothing moved: a retry is safe
   log(`  tx jupiter-${label} confirmed ${sig}`);
   return { ok: true, inUi: q.inUi, outUi: q.outUi, sig };
 }
 
 async function livePositionCycle(state, stop) {
-  const v = await liveValuation(state.position);
+  if (state.position && !(Number(state.position.depositSol) > 0)) { const gone = await emptyLivePositionCleanup(state, state.position); if (gone || !state.position || !(await repairZeroDeposit(state, state.position))) return null; }   // never valued / closed through the normal path while it holds nothing; liquidity found after all -> booked and valued normally (live-pnl-fix)
+  let v;
+  try { v = await liveValuation(state.position); if (state.position.missingPolls) { delete state.position.missingPolls; } }
+  catch (e) {
+    // H1 (review port): the position account is gone. getPosition() would throw on every poll forever (ghost position, SL/TP never run again).
+    const pos = state.position, ex = await accountExists(new PublicKey(pos.position));
+    if (ex !== false) throw e;   // RPC trouble or another error: held, retried next poll
+    if (pos.closePendingReason) { log(`  ${pos.name}: the interrupted close already removed the position account: finishing the booking (${pos.closePendingReason})`); await finishGhostClose(state, pos); return null; }
+    pos.missingPolls = (Number(pos.missingPolls) || 0) + 1; saveState(state, path.join(DIR, 'state.json'));
+    if (pos.missingPolls < 3) { log(`  ${pos.name}: position account not found on chain (${pos.missingPolls}/3), checking again next poll`); return null; }
+    await bookClosedOutside(state, pos); return null;
+  }
+  if (v && v.externalCapital) saveState(state, path.join(DIR, 'state.json'));
   const ageH = (Date.now() - Date.parse(state.position.openedAt)) / 3.6e6;
   const live = { valueSol: +v.value.toFixed(5), pnlSol: +(v.value - state.position.depositSol).toFixed(5), quoteMint: state.position.quoteMint === USDC ? 'USDC' : 'SOL', pnlPct: +(v.pnl * 100).toFixed(2), feesSol: +v.fees.toFixed(5), ageH: +ageH.toFixed(2), price: v.price, inRange: v.inRange };   // Item 1 (N1): quote units of pnlSol — liveCycle converts USDC legs at the SOL price
   state.position.lastActiveBin = v.activeBinId;   // exitQuotePriority() reads it, like the dry run
+  state.position.lastValuation = { value: v.value, pnl: v.pnl, fees: v.fees, price: v.price, at: now() };   // H1: last known value, if the account disappears
   log(`monitor ${state.position.name}: value=${live.valueSol} SOL pnl=${live.pnlPct}% fees=${live.feesSol} age=${live.ageH}h inRange=${v.inRange}`);
   // Same decision code as the dry run (live-exit.js -> paper-usdc.exitQuote + paper-exit-policy.decide). Only the executor (liveClose) is live-specific.
   let exitReason = stop ? 'STOP file' : null, decisionVal = null;
-  if (!stop) {
+  const closePending = state.position && state.position.closePendingReason;   // an earlier close attempt was interrupted: finish it, never re-judge the half-withdrawn position
+  if (closePending && !stop) { log(`  resuming the interrupted close of ${state.position.name} (${closePending})`); exitReason = closePending; }
+  if (!stop && !closePending) {
     try {
       const pollId = state.livePollSequence = (state.livePollSequence || 0) + 1;
       const r = await liveExit.decideLiveExit({ pos: state.position, v, pxUsd: await solUsd(), quote: jupiterQuote, txFee: CFG.TX_FEE_SOL, CFG, pollId });
@@ -2424,11 +2688,108 @@ async function livePositionCycle(state, stop) {
   return live;
 }
 
+// H2 (live-bugfix): every DLMM position the wallet owns on chain vs the positions in state. Runs between cycles (nothing in flight): at start and every 30 min.
+//  - funded position not in state (an open whose tx landed but was never recorded, or one opened by hand in this wallet): ADOPTED into management
+//    (valued now, SL / TP / emergency / reshape from here) and operator is told. Never closed automatically.
+//  - empty position from our own pending open: closed (rent back). Empty unknown position: only reported.
+const RECONCILE_EVERY_MS = 30 * 60_000;
+async function reconcileLive(state, { why = 'periodic', adopt = true } = {}) {
+  let map = null, full = true;
+  try { map = await DLMM.getAllLbPairPositionsByUser(conn, wallet.publicKey); }
+  catch (e) { full = false; log(`reconcile (${why}): full on-chain position list unavailable (${String(e.message).split('\n')[0].slice(0, 160)}); checking pending opens one by one`); }
+  const onchain = [];
+  const liq = d => (d.positionBinData || []).some(b => Number(b.positionXAmount) > 0 || Number(b.positionYAmount) > 0) || Number(d.totalXAmount) > 0 || Number(d.totalYAmount) > 0;
+  if (full) for (const [pair, info] of map) for (const pp of info.lbPairPositionsData || []) { const d = pp.positionData || {}; onchain.push({ position: pp.publicKey.toBase58(), pool: String(pair), hasLiquidity: liq(d), info, d }); }
+  else for (const pnd of state.pendingOpens || []) {   // fallback: at least our own pending opens are settled
+    const ex = await accountExists(new PublicKey(pnd.position));
+    if (ex !== true) continue;
+    try { const lb = await (await dlmmFor(pnd.pool, { fresh: true })).getPosition(new PublicKey(pnd.position)); onchain.push({ position: pnd.position, pool: pnd.pool, hasLiquidity: liq(lb.positionData), d: lb.positionData }); } catch { /* next reconcile */ }
+  }
+  state.positions = livePositions.list(state).slice();
+  const plan = liveSafety.reconcilePlan({ onchain, known: state.positions, pending: state.pendingOpens || [] });
+  if (!full) { plan.missing = []; plan.unknownEmpty = []; plan.stalePending = plan.stalePending.filter(pnd => onchain.every(o => o.position !== pnd.position)); }
+  const file = path.join(DIR, 'state.json');
+  let changed = false;
+  for (const a of plan.adopt) {
+    if (!adopt) { if (!(state.reconcileNotified || []).includes(a.position)) { (state.reconcileNotified = state.reconcileNotified || []).push(a.position); changed = true; log(`reconcile (${why}): funded position ${a.position} not in state; STOP is set, so it is NOT adopted (STOP would close it)`); notifyTg(`⚠️ Wallet has a funded DLMM position the bot does not know (${a.position.slice(0, 8)}…). STOP is set, so it was not adopted; it is adopted after STOP is removed.`); } continue; }
+    try {
+      const dlmm = await dlmmFor(a.pool, { fresh: true });
+      const quoteMint = dlmm.tokenY.publicKey.toBase58(), mintX = dlmm.tokenX.publicKey.toBase58();
+      let rec;
+      if (a.pending) {
+        rec = liveSafety.adoptRecord({ draft: a.pending.draft });
+        const real = await onchainQuoteDeposit(dlmm, { publicKey: new PublicKey(a.position) });
+        bookOnchainDeposit(rec, { complete: false, depositedLamports: 0 }, real, quoteMint === USDC ? { unit: 1e6, quote: 'USDC' } : { unit: LAMPORTS_PER_SOL, quote: 'SOL' });
+      } else {
+        if (quoteMint !== SOL && quoteMint !== USDC) { log(`reconcile: unknown position ${a.position} in a ${quoteMint.slice(0, 6)}-quoted pool: not adopted (only SOL / USDC pools are managed)`); notifyTg(`⚠️ Wallet has a DLMM position the bot does not know (${a.position.slice(0, 8)}…, pool quote not SOL/USDC). Not managed.`); continue; }
+        const active = await dlmm.getActiveBin(), price = +dlmm.fromPricePerLamport(+active.price);
+        const dX = 10 ** dlmm.tokenX.mint.decimals, dY = 10 ** dlmm.tokenY.mint.decimals, d = a.d;
+        const valueQuote = +d.totalYAmount / dY + (+d.totalXAmount / dX) * price + (+String(d.feeY || 0)) / dY + (+String(d.feeX || 0)) / dX * price;
+        let rentRef = 0; try { const ai = await conn.getAccountInfo(new PublicKey(a.position)); rentRef = ai ? ai.lamports / LAMPORTS_PER_SOL : 0; } catch { /* 0 */ }
+        let pool = null; try { pool = await fetchPool(a.pool); } catch { /* name from mint */ }
+        const px = await solUsd().catch(() => 0);
+        if (quoteMint === SOL && !(px > 0)) throw new Error('no SOL/USD price for the USDC basis of a SOL-quoted position');
+        rec = liveSafety.adoptRecord({ position: a.position, pool: a.pool, name: pool?.name || (mintX.slice(0, 4) + '-' + (quoteMint === SOL ? 'SOL' : 'USDC')), mintX, decX: dlmm.tokenX.mint.decimals, quoteMint, quoteDecimals: dlmm.tokenY.mint.decimals,
+          minBinId: d.lowerBinId, maxBinId: d.upperBinId, activeBinId: active.binId, binStep: Number(dlmm.lbPair.binStep), price, valueQuote, rentRefundableSol: rentRef, pxUsd: px, strategySettings: strategy.snapshot(CFG), tvlUsd: pool?.tvl ?? null, now: now() });
+        // v1 runs USDC capital only: a SOL-quoted pool position is managed like a v1 SOL-pool open (quote SOL, basis and exit in USDC).
+        if (rec.capitalAsset === 'SOL') { rec.capitalAsset = 'USDC'; delete rec.capitalInSol; }
+      }
+      state.positions.push(rec); state.pendingOpens = (state.pendingOpens || []).filter(x => x.position !== a.position); changed = true;
+      log(`reconcile (${why}): ADOPTED ${rec.name} ${a.position} (${a.pending ? 'open whose tx landed but was not recorded' : 'unknown funded position in this wallet'}), value basis ${(+rec.depositSol).toFixed(5)} ${rec.quoteSymbol || 'SOL'}; managed from now on`);
+      notifyTg(`⚠️ ${rec.name}: found a funded DLMM position on chain that was not in the bot's state (${a.pending ? 'open tx landed but was not recorded' : 'unknown position in this wallet'}). It is now managed by the bot (SL/TP/emergency active). Nothing was closed.`);
+    } catch (e) { log(`reconcile: adopting ${a.position} failed (retry next reconcile): ${e.message}`); }
+  }
+  for (const a of plan.emptyPending) {
+    const pseudo = { ...a.pending.draft, depositSol: 0 };
+    log(`reconcile (${why}): our pending open ${a.position} exists but holds nothing: closing it for the rent`);
+    if (await emptyLivePositionCleanup(state, pseudo)) { state.pendingOpens = (state.pendingOpens || []).filter(x => x.position !== a.position); changed = true; }
+  }
+  state.reconcileNotified = state.reconcileNotified || [];
+  for (const a of plan.unknownEmpty) if (!state.reconcileNotified.includes(a.position)) { state.reconcileNotified.push(a.position); changed = true; log(`reconcile (${why}): empty unknown position ${a.position} in pool ${a.pool}: left alone`); notifyTg(`ℹ️ Wallet has an empty DLMM position the bot does not know (${a.position.slice(0, 8)}…). Left alone.`); }
+  for (const pnd of plan.stalePending) if (Date.now() - Date.parse(pnd.at) > 10 * 60_000 && (full || (await accountExists(new PublicKey(pnd.position))) === false)) { state.pendingOpens = state.pendingOpens.filter(x => x !== pnd); changed = true; log(`reconcile (${why}): pending open ${pnd.position} never reached the chain: dropped`); }
+  for (const m of plan.missing) log(`reconcile (${why}): ${m} is in state but not in the on-chain list (handled by the position poll)`);
+  if (changed) { livePositions.syncPositions && livePositions.syncPositions(state); saveState(state, file); }
+  state.lastReconcile = { at: now(), why, full, onchain: onchain.length, known: state.positions.length, adopted: plan.adopt.length, emptyPending: plan.emptyPending.length, unknownEmpty: plan.unknownEmpty.length, missing: plan.missing.length };
+  log(`reconcile (${why}): ${full ? '' : '(pending opens only) '}on-chain ${onchain.length} position(s), state ${state.positions.length}, adopted ${plan.adopt.length}, missing ${plan.missing.length}`);
+  return state.lastReconcile;
+}
 async function liveCycle(state) {
   applyPaperSettings();
   const stop = fs.existsSync(path.join(DIR, 'STOP'));
   const noNew = fs.existsSync(path.join(DIR, 'NO_NEW'));
-  state.positions = livePositions.list(state).slice(); state.position = null; state.__active = null;
+  state.positions = livePositions.dedupeList(livePositions.list(state)); state.position = null; state.__active = null;   // the loaded file's "position" is a COPY of positions[0]: never re-add it as a second position
+  if (!CFG.DRY_RUN && Date.now() - (liveCycle.lastReconcileMs || 0) >= RECONCILE_EVERY_MS) { liveCycle.lastReconcileMs = Date.now(); try { await reconcileLive(state, { why: liveCycle.reconciledOnce ? 'periodic' : 'startup', adopt: !fs.existsSync(path.join(DIR, 'STOP')) }); } catch (e) { log('reconcile error: ' + e.message); } liveCycle.reconciledOnce = true; }
+  // Tokens a close could not sell (Jupiter 422 / 429): keep selling them to the position's capital asset (SOL, or USDC for USDC capital) until the wallet holds none.
+  // M6 (live-bugfix): slippage grows 3% -> max 8% (was up to 30%), retries back off 1 min -> 1 h, operator is told after 3 failures (then every 6 h).
+  // Only this bot's own amount is sold (ownedRaw), and the closed row it belongs to is corrected with the real proceeds (M3).
+  if (state.pendingSells && state.pendingSells.length) {
+    let touched = false;
+    for (const ps of [...state.pendingSells]) {
+      const plan = liveSafety.pendingSellPlan(ps, Date.now());
+      if (!plan.due) continue;
+      touched = true;
+      try {
+        const { raw: bal } = await walletTokenRawOf(ps.mint);
+        const raw = ps.ownedRaw != null && BigInt(ps.ownedRaw) < bal ? BigInt(ps.ownedRaw) : bal;
+        const row = ps.row ? (state.history || []).find(h => h.position === ps.row.position && (!ps.row.closedAt || h.closedAt === ps.row.closedAt)) : null;
+        if (raw === 0n) { state.pendingSells = state.pendingSells.filter(x => x !== ps); if (row && row.pendingTokenEstimateUsdc > 0) liveSafety.adjustRowForSaleUsdc(row, 0); if (row && row.pendingTokenEstimateSol > 0) liveSafety.adjustRowForSale(row, 0, await solUsd().catch(() => 0)); log(`pending sell ${ps.name}: nothing left in the wallet${row ? ' (row re-booked without the unsold token)' : ''}`); continue; }
+        const toUsdc = ps.to === 'USDC';   // USDC-capital closes go back to USDC, SOL-capital closes to SOL
+        const r = await jupiterSwapLive(ps.mint, toUsdc ? USDC : SOL, raw, ps.dec, toUsdc ? 6 : 9, toUsdc ? 'retry-sell-usdc' : 'retry-sell', plan.slippageBps);
+        if (!(r.ok && !r.dry)) throw new Error(r.error || 'swap not sent');
+        state.pendingSells = state.pendingSells.filter(x => x !== ps);
+        if (toUsdc) { const gotU = Number(r.outUi) || 0; if (row && Number(row.pendingTokenEstimateUsdc) > 0) { const d = liveSafety.adjustRowForSaleUsdc(row, gotU); log(`pending sell ${ps.name}: closed trade corrected by ${d >= 0 ? '+' : ''}${d.toFixed(4)} USDC (estimate -> real)`); } log(`pending sell ${ps.name}: sold ${r.inUi} -> ${gotU.toFixed(4)} USDC at max ${plan.slippageBps / 100}% slippage`); continue; }
+        let got = Number(r.outUi) || 0;
+        if (r.sig) { try { const tx = await conn.getTransaction(r.sig, { commitment: 'confirmed', maxSupportedTransactionVersion: 0 }); const d = liveSafety.lamportDelta(tx); if (d != null) got = d / LAMPORTS_PER_SOL; } catch { /* quote amount */ } }
+        if (row && Number(row.pendingTokenEstimateSol) > 0) { const d = liveSafety.adjustRowForSale(row, got, await solUsd().catch(() => 0)); log(`pending sell ${ps.name}: closed trade corrected by ${d >= 0 ? '+' : ''}${d.toFixed(6)} SOL (estimate -> real)`); }
+        log(`pending sell ${ps.name}: sold ${r.inUi} -> ${got.toFixed(6)} SOL at max ${plan.slippageBps / 100}% slippage`);
+      } catch (e) {
+        const f = liveSafety.pendingSellFailed(ps, Date.now());
+        log(`pending sell ${ps.name} failed (try ${ps.tries}, next in ${Math.round(f.nextInMs / 60000)} min): ${e.message}`);
+        if (f.notify) notifyTg(`⚠️ Token ${ps.name} could not be sold after ${ps.tries} tries (max ${liveSafety.PENDING_SELL.maxBps / 100}% slippage). It stays in the wallet; the bot keeps retrying (next in ${Math.round(f.nextInMs / 60000)} min).`);
+      }
+    }
+    if (touched) saveState(state, path.join(DIR, 'state.json'));
+  }
   const lives = [];
   for (const pos of [...state.positions]) {
     try { const live = await livePositions.withPos(state, pos, () => livePositionCycle(state, stop)); if (live) lives.push(live); }
@@ -2593,7 +2954,23 @@ async function liveCycle(state) {
 
   wallet = loadWallet();
   log(`start: wallet ${wallet.publicKey.toBase58()} rpc=[configured] DRY_RUN=${CFG.DRY_RUN} LIVE_CONFIRMED=${process.env.LIVE_CONFIRMED === '1'} balance=${(await realSolBal(wallet.publicKey)).toFixed(5)} SOL`);
-  const state = loadState(path.join(DIR, 'state.json'));
+  // H3 (live-bugfix): an unreadable live state must never become an empty one (that forgets open positions). Fall back to state.json.bak, or refuse to start.
+  let state;
+  try {
+    const r = liveSafety.readStateStrict(path.join(DIR, 'state.json'), () => ({ position: null, history: [], lastScan: null, virtual: null, reshapes: [] }));
+    state = r.state;
+    if (r.source === 'bak') { log(`WARNING state.json unreadable (${r.error}): started from state.json.bak`); notifyTg(`⚠️ Live bot: state.json was unreadable (${r.error}). Started from the last good backup (state.json.bak); the reconcile checks on-chain positions now.`); }
+    try {
+      // position on disk is a JSON copy of positions[0]: never let saveState / persistView push it as a second slot
+      livePositions.syncPositions(state); state.position = null; state.__active = null;
+    } catch (e) { log('  position sync failed: ' + e.message); }
+  } catch (e) {
+    log('fatal: ' + e.message);
+    const mark = path.join(DIR, 'state-unreadable.notified');
+    try { if (!fs.existsSync(mark) || Date.now() - fs.statSync(mark).mtimeMs > 3600_000) { fs.writeFileSync(mark, now()); telegram.send('🛑 Live bot NOT started: state.json is unreadable and no valid backup exists. Positions may be open on chain; fix the state file by hand.'); await sleep(5000); } } catch { /* ignore */ }
+    await sleep(60_000);   // pm2 restarts us: keep the loop slow
+    process.exit(1);
+  }
   while (true) {
     let exit = false;
     try { exit = await liveCycle(state); }

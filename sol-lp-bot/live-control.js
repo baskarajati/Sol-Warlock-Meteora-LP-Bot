@@ -148,7 +148,7 @@ function createArmStore({ ttlMs = ARM_TTL_MS } = {}) {
 }
 
 async function defaultGetBalances(address, rpc) {
-  const conn = new Connection(rpc || require('./rpc-config').url(), 'confirmed');
+  const conn = rpc ? new Connection(rpc, 'confirmed') : require('./rpc-config').connection('confirmed');   // review fix: RPC_URL_1..3 failover
   const pk = new PublicKey(address);
   const solLamports = await conn.getBalance(pk);
   const sol = solLamports / LAMPORTS_PER_SOL;

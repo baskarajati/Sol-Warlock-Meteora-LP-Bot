@@ -8,6 +8,19 @@
 > with `SyntaxError: Identifier 'fs' has already been declared`. `maxFeeBps` is 0
 > for both bots (v2 fee removed). The Item 1 <-> Item 4a `bot.js` hand-merge (N3)
 > is still open: the Item 4a diffs were not applied.
+>
+> **v2 live-bugfix set ported to v1 (same branch, review fix).** v1 `bot.js` now has
+> the v2 safety code: `send()` re-broadcast + status loop (`confirmRaw`), Jupiter
+> swaps through the same loop (`sendSwapTx`, amounts sent as strings: v1 sent
+> numbers, which Jupiter answers with 422), tracked opens (`pendingOpens`),
+> resumable and ghost closes (`closePendingReason`, `closeSigs`, saved swap-back
+> result), `reconcileLive` at start and every 30 min (adopts as USDC capital),
+> pending token sells with capped slippage, atomic `state.json` + strict load, the
+> duplicate-position fix in `live-positions.js`, and `RPC_URL_1..3` failover
+> (`rpc-config.js`, also in `live-control.js` and the mini app). Modules copied
+> from v2: `live-safety.js`, `live-positions.js`, `live-open-exec.js`,
+> `live-close-exec.js`, `rpc-config.js`. Tests: `sol-lp-bot/test-live-*.js`,
+> `sol-lp-bot/test-rpc-*.js`.
 
 Snapshot of the Warlock live system-readiness **Phase 1** code (2026-11-24) for
 independent bug review by sole's Claude. Branched from `main`

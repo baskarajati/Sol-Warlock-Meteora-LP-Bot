@@ -33,14 +33,14 @@ async function rentScan(opts, secretsDir) {
   if (!meta.hasKey || !meta.publicAddress) return { ok: false, status: 400, error: 'key not stored' };
   if (opts.rentScanFn) return { ok: true, ...(await opts.rentScanFn(meta.publicAddress)) };
   const web3 = require('@solana/web3.js');
-  const conn = new web3.Connection(opts.rpc || require('../rpc-config').url(), 'confirmed');
+  const conn = opts.rpc ? new web3.Connection(opts.rpc, 'confirmed') : require('../rpc-config').connection('confirmed');   // review fix: RPC_URL_1..3 failover
   return { ok: true, ...(await tokenRent.scan({ conn, owner: meta.publicAddress, PublicKey: web3.PublicKey, protectedMints: liveProtectedMints(opts) })) };
 }
 async function rentClaim(opts, secretsDir) {
   if (opts.rentClaimFn) return opts.rentClaimFn();
   const web3 = require('@solana/web3.js'), spl = require('@solana/spl-token');
   const keypair = walletStore.loadKeypair(secretsDir);
-  const conn = new web3.Connection(opts.rpc || require('../rpc-config').url(), 'confirmed');
+  const conn = opts.rpc ? new web3.Connection(opts.rpc, 'confirmed') : require('../rpc-config').connection('confirmed');   // review fix: RPC_URL_1..3 failover
   const prep = async tx => { tx.feePayer = keypair.publicKey; tx.recentBlockhash = (await conn.getLatestBlockhash('confirmed')).blockhash; return tx; };
   return tokenRent.claim({
     conn, keypair, web3, spl, protectedMints: liveProtectedMints(opts),
