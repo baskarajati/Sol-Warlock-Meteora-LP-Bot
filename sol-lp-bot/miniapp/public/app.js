@@ -96,7 +96,7 @@
     return esc(head)+'<small class="pnl-usd"> '+esc(usdPart)+'</small>';
   }
   function solChangeText(d){return numeric(d?.solPriceChangePct)?`SOL sejak entry: ${money(d.displaySolUsdEntry)} → ${money(d.displaySolUsd)} (${d.solPriceChangePct>=0?'+':''}${(+d.solPriceChangePct).toFixed(2)}%)`:'';}
-  let lastPayload = null, closedRows = [], statusBusy = false, lastSuccessAt = 0;
+  let lastPayload = null, closedRows = [], closedAll = [], feedRows = [], fullHist = null, settingsChanges = [], histBusy = false, histAt = 0, historyRange = (()=>{try{return localStorage.getItem('historyRange')||'all'}catch{return 'all'}})(), statusBusy = false, lastSuccessAt = 0;
   let lpAgentUrl = 'https://app.lpagent.io/portfolio';
   const validCA = (v) => typeof v === 'string' && /^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(v);
   function ago(at) {
@@ -205,9 +205,67 @@
   function durText(r){const a=Date.parse(r.openedAt),b=Date.parse(r.closedAt);if(!(Number.isFinite(a)&&Number.isFinite(b)&&b>=a))return r.hold||'—';const m=Math.round((b-a)/60000),h=Math.floor(m/60);return h?h+'j '+(m%60)+'m':m+'m';}
   function isUsdcCapital(r){return (r?.capitalAsset||'USDC')!=='SOL'&&numeric(r?.pnlUsd);}   // modal utama USDC: hasil utama = net USDC (sudah termasuk swap, gas, rent)
   function closeBadge(r){const g=closeTag(r);return g?`<b style="display:inline-block;background:${g.c};color:#fff;border-radius:4px;padding:1px 6px;font-size:9px;font-weight:800;letter-spacing:.5px;margin-right:6px">${esc(g.t)}</b><b style="color:${g.c}">${esc(g.l)}</b><br>`:'';}
+  // PATCHED 2026-11-17: full history (server /api/history), period selector, exit-type table,
+  // equity curve with max drawdown, settings-change markers, re-entry flags. Display only.
+  const histKey=r=>(r.pool||'')+'|'+(r.closedAt||'');
+  async function loadHistory(){if(histBusy)return;histBusy=true;histAt=Date.now();
+    try{const r=await api('GET','/api/history');if(r.status===200&&r.json.ok){fullHist=r.json.rows||[];settingsChanges=r.json.settingsChanges||[];mergeHistory();}}catch{}finally{histBusy=false;}}
+  function mergeHistory(){
+    const m=new Map();for(const r of [...(fullHist||[]),...feedRows])m.set(histKey(r),r);
+    const asc=[...m.values()].sort((a,b)=>Date.parse(a.closedAt)-Date.parse(b.closedAt));
+    const last=new Map();
+    for(const r of asc){const tok=r.mintX||String(r.name||'').split('-')[0];const prev=last.get(tok);r._re=null;
+      if(prev){const gap=(Date.parse(r.openedAt)-Date.parse(prev.closedAt))/60000;if(gap>=0&&gap<=60)r._re={gap:Math.round(gap),prev:prev.reason,prevPnl:+prev.pnlUsd};}
+      last.set(tok,r);}
+    closedAll=asc.reverse();applyHistoryRange();
+    if(Date.now()-histAt>60000)loadHistory();
+  }
+  const lastChangeAt=()=>settingsChanges.length?Date.parse(settingsChanges[settingsChanges.length-1].at):null;
+  function exitKind(r){const x=String(r.reason||'').split(' ')[0];
+    return ({emergency_stop:'Stop loss',emergency_slplus:'Kunci profit (SL+)',emergency_tp:'TP emergency',oor_right_take_profit:'Harga di atas range · profit',oor_right_reposition_limit:'Harga di atas range · batas reposition',max:'Stale (umur maks)',trailing_tp_usdc:'Trailing stop'})[x]||(closeTag(r)?.l)||x||'lainnya';}
+  function exitTable(rows){
+    const g=new Map();for(const r of rows){const k=exitKind(r),v=+r.pnlUsd;if(!Number.isFinite(v))continue;const e=g.get(k)||{n:0,sum:0,c:closeTag(r)?.c||'#64748b'};e.n++;e.sum+=v;g.set(k,e);}
+    if(!g.size)return '';
+    const list=[...g.entries()].sort((a,b)=>a[1].sum-b[1].sum);
+    return `<div class="card hist-card"><div class="k">Hasil per jenis exit</div><table class="exit-table"><thead><tr><th>Jenis</th><th>n</th><th>Total</th><th>Rata²</th></tr></thead><tbody>${list.map(([k,e])=>`<tr><td><i style="background:${e.c}"></i>${esc(k)}</td><td class="mono">${e.n}</td><td class="mono ${pnlClass(e.sum)}">${esc(signed(e.sum))}</td><td class="mono ${pnlClass(e.sum/e.n)}">${esc(signed(e.sum/e.n))}</td></tr>`).join('')}</tbody></table></div>`;
+  }
+  function equityCurve(rows){
+    const asc=rows.slice().reverse().filter(r=>Number.isFinite(+r.pnlUsd));if(asc.length<2)return '';
+    const cum=[0];for(const r of asc)cum.push(cum[cum.length-1]+(+r.pnlUsd));
+    let peak=0,pi=0,dd=0,ddP=0,ddT=0;cum.forEach((v,i)=>{if(v>cum[pi]){pi=i;}if(cum[pi]-v>dd){dd=cum[pi]-v;ddP=pi;ddT=i;}});
+    const W=340,H=140,L=6,R=6,T=10,B=16,lo=Math.min(0,...cum),hi=Math.max(0,...cum),span=(hi-lo)||1;
+    const X=i=>L+(W-L-R)*i/(cum.length-1),Y=v=>T+(H-T-B)*(hi-v)/span;
+    const pts=cum.map((v,i)=>X(i).toFixed(1)+','+Y(v).toFixed(1)).join(' ');
+    const ddPts=cum.slice(ddP,ddT+1).map((v,k)=>X(ddP+k).toFixed(1)+','+Y(v).toFixed(1)).join(' ');
+    const t0=Date.parse(asc[0].closedAt),t1=Date.parse(asc[asc.length-1].closedAt);
+    const marks=settingsChanges.filter(c=>{const t=Date.parse(c.at);return t>=t0-864e5&&t<=Date.now();}).map(c=>{const t=Date.parse(c.at),n=asc.filter(r=>Date.parse(r.closedAt)<t).length;return {c,x:X(n)};});
+    const end=cum[cum.length-1];
+    return `<div class="card hist-card"><div class="k">Kurva equity realized · ${asc.length} posisi</div>
+      <svg class="eq-chart" viewBox="0 0 ${W} ${H}" role="img" aria-label="Kurva PnL kumulatif"><line x1="${L}" x2="${W-R}" y1="${Y(0).toFixed(1)}" y2="${Y(0).toFixed(1)}" stroke="var(--hint)" stroke-dasharray="3 3" stroke-width="1" opacity=".5"/>
+      ${marks.map(m=>`<line x1="${m.x.toFixed(1)}" x2="${m.x.toFixed(1)}" y1="${T}" y2="${H-B}" stroke="#f59e0b" stroke-dasharray="2 3" stroke-width="1.2"/><text x="${(m.x+3).toFixed(1)}" y="${T+8}" font-size="9" fill="#f59e0b">⚙</text>`).join('')}
+      <polyline points="${pts}" fill="none" stroke="#8b5cf6" stroke-width="2" stroke-linejoin="round"/>
+      ${dd>0?`<polyline points="${ddPts}" fill="none" stroke="var(--danger)" stroke-width="2.4" stroke-linejoin="round"/>`:''}
+      <circle cx="${X(cum.length-1).toFixed(1)}" cy="${Y(end).toFixed(1)}" r="3" fill="#8b5cf6"/>
+      <text x="${L}" y="${H-3}" font-size="9" fill="var(--hint)">${esc(wib(asc[0].closedAt).slice(0,16))}</text><text x="${W-R}" y="${H-3}" font-size="9" fill="var(--hint)" text-anchor="end">${esc(wib(asc[asc.length-1].closedAt).slice(0,16))}</text></svg>
+      <div class="eq-legend"><span>Akhir <b class="mono ${pnlClass(end)}">${esc(signed(end))}</b></span><span><i style="background:var(--danger)"></i>Drawdown maks <b class="mono negative">${dd>0?esc(signed(-dd)):'—'}</b></span>${marks.length?'<span><i style="background:#f59e0b"></i>Ubah setting</span>':''}</div>
+      ${marks.length?`<div class="eq-changes">${marks.slice(-4).reverse().map(m=>`<div><span class="mono">${esc(m.c.wib.slice(0,16))}</span> ${esc(m.c.text||m.c.action)}</div>`).join('')}</div>`:''}</div>`;
+  }
+  function reentryBadge(r){return r._re?`<b style="color:#f59e0b">↻ RE-ENTRY ${r._re.gap}m setelah ${esc(exitKind({reason:r._re.prev}))}</b><br>`:'';}
+  function applyHistoryRange(){
+    const since=lastChangeAt();
+    if(historyRange==='since'&&!since)historyRange='all';
+    const ms={ '24h':86400000, '7d':7*86400000 }[historyRange];
+    closedRows=historyRange==='since'?closedAll.filter(r=>Date.parse(r.openedAt)>=since):ms?closedAll.filter(r=>Date.parse(r.closedAt)>=Date.now()-ms):closedAll.slice();
+    document.querySelectorAll('[data-history-range]').forEach(b=>{b.classList.toggle('active',b.dataset.historyRange===historyRange);if(b.dataset.historyRange==='since')b.classList.toggle('hidden',!since);});
+    const el=$('history-sum');
+    if(el){const v=closedRows.map(r=>+r.pnlUsd).filter(Number.isFinite),net=v.reduce((a,b)=>a+b,0),w=v.filter(x=>x>0).length,re=closedRows.filter(r=>r._re),reNet=re.reduce((a,r)=>a+(+r.pnlUsd||0),0);
+      el.innerHTML=closedRows.length?`${closedRows.length} posisi · ${w} profit / ${v.length-w} rugi · net <b class="${pnlClass(net)}">${esc(signed(net))} USDC</b>${re.length?` · ${re.length} re-entry (net <b class="${pnlClass(reNet)}">${esc(signed(reNet))}</b>)`:''}${historyRange==='since'?` · dibuka sejak ${esc(settingsChanges[settingsChanges.length-1].wib.slice(0,16))}`:''}${!fullHist&&feedRows.length>=100?' · menampilkan 100 posisi terakhir':''}`:(historyRange==='since'?'Belum ada posisi yang dibuka sejak setting terakhir diubah.':'');}
+    const st=$('history-stats');if(st)setMarkup(st,exitTable(closedRows)+equityCurve(closedRows));
+    renderClosed();
+  }
   function renderClosed() {
     const rows=closedRows.filter(r=>!$('hide-dust').checked || Math.abs(+r.pnlUsd||0)>=.1);
-    setMarkup($('closed'), rows.length?rows.map(r=>`<button class="card closed-row" data-trade="${closedRows.indexOf(r)}"><span><strong>${esc(r.name||'Pool')}</strong><small>${closeBadge(r)}${esc(wib(r.closedAt))} · ⏱ ${esc(durText(r))} · ${esc(r.closeReasonText||r.reason||'closed')}</small><small>${esc(r.openContext?.source||'tidak diketahui')} · ${esc(r.openContext?.reason||'Alasan buka tidak diketahui')}${r.corrected?' · DIKOREKSI (data asli disimpan)':''}</small></span><span class="mono ${isUsdcCapital(r)?pnlClass(r.pnlUsd):(numeric(r.pnlQuote)&&numeric(r.pnlQuoteUsd)?pnlClass(r.pnlQuoteUsd):pnlClass(r.pnlUsd))}">${isUsdcCapital(r)?esc(signedWithPct(r.pnlUsd,entryCapitalUsd(r))+' USDC'):(numeric(r.pnlQuote)?quotePnlHtml(r,entryCapitalUsd(r)):esc(signedWithPct(r.pnlUsd,entryCapitalUsd(r))+' USDC (riwayat lama)'))}<small>Lihat detail ↗</small></span></button>`).join(''):'<div class="card empty">Belum ada posisi ditutup dalam 24 jam.</div>');
+    setMarkup($('closed'), rows.length?rows.map(r=>`<button class="card closed-row" data-trade="${closedRows.indexOf(r)}"><span><strong>${esc(r.name||'Pool')}</strong><small>${closeBadge(r)}${reentryBadge(r)}${esc(wib(r.closedAt))} · ⏱ ${esc(durText(r))} · ${esc(r.closeReasonText||r.reason||'closed')}</small><small>${esc(r.openContext?.source||'tidak diketahui')} · ${esc(r.openContext?.reason||'Alasan buka tidak diketahui')}${r.corrected?' · DIKOREKSI (data asli disimpan)':''}</small></span><span class="mono ${isUsdcCapital(r)?pnlClass(r.pnlUsd):(numeric(r.pnlQuote)&&numeric(r.pnlQuoteUsd)?pnlClass(r.pnlQuoteUsd):pnlClass(r.pnlUsd))}">${isUsdcCapital(r)?esc(signedWithPct(r.pnlUsd,entryCapitalUsd(r))+' USDC'):(numeric(r.pnlQuote)?quotePnlHtml(r,entryCapitalUsd(r)):esc(signedWithPct(r.pnlUsd,entryCapitalUsd(r))+' USDC (riwayat lama)'))}<small>Lihat detail ↗</small></span></button>`).join(''):'<div class="card empty">Belum ada posisi ditutup dalam 24 jam.</div>');
   }
   function portfolioPnl(entries,stats){
     const sum=xs=>xs.every(numeric)?xs.reduce((n,v)=>n+Number(v),0):null;
@@ -287,7 +345,7 @@
     // Stable DOM while unchanged: preserves scrolling and button focus across polls.
     if ($('activity').innerHTML!==feed) $('activity').innerHTML=feed;
     if($('archive-note'))$('archive-note').textContent=`${stats.archivedCount||0} posisi >$500 diarsipkan (disembunyikan dari daftar, tetap dihitung di Total PnL ${signed(stats.archivedPnlUsd??0)}). History: ${stats.trades??0} posisi · win rate ${stats.winRate??0}% · PnL terlihat ${signed(stats.totalNetPnlUsd)} · Total PnL ${signed(stats.totalNetPnlAllUsd??stats.totalNetPnlUsd)} USDC. Equity tetap seluruh saldo/posisi nyata.`;
-    closedRows=(summary.closedRecent||[]).filter(r=>Date.parse(r.closedAt)>=Date.now()-86400000).reverse();renderClosed();
+    feedRows=summary.closedRecent||[];mergeHistory();
     $('window-info').textContent=`Window sampai ${st.window?.endsWib||summary.endsWib||'—'} · UI poll 7 detik · scan saat flat 5 menit. PnL risiko sesuai aset modal saat entry (${capitalUnit}); angka paper bukan hasil live.`;
   }
   async function statusPoll() {
@@ -422,6 +480,7 @@
   });
 
   $('hide-dust').addEventListener('change',renderClosed);
+  document.querySelectorAll('[data-history-range]').forEach(b=>b.addEventListener('click',()=>{historyRange=b.dataset.historyRange;try{localStorage.setItem('historyRange',historyRange)}catch{}applyHistoryRange();}));
   $('close-modal').onclick=()=>hideSheet($('trade-modal'));
   $('cal-day-close').onclick=()=>hideSheet($('cal-day-modal'));
   $('cal-day-modal').addEventListener('click',e=>{if(e.target===$('cal-day-modal'))hideSheet($('cal-day-modal'));});

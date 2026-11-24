@@ -267,6 +267,33 @@ function createApp(opts = {}) {
       const envFile = require('../env-config').read(path.join(__dirname, '..'));
       return send(res, 200, { ok: true, ...cal.build(paperDir), mode: cal.mode({ ...process.env, ...envFile }, liveControl.isStopPresent(stopPath)) });
     }
+    // PATCHED 2026-11-17: full paper history (not just the bot's last-100 feed) + settings-change log, read-only.
+    if (req.method === 'GET' && pathname === '/api/history') {
+      const gate = authInit(req, { initData: url.searchParams.get('initData') || req.headers['x-telegram-init-data'] });
+      if (!gate.ok) return send(res, gate.status, { ok: false, error: gate.error, reason: gate.reason, locked: locked() });
+      let st;
+      try { st = JSON.parse(fs.readFileSync(path.join(paperDir, 'state.json'), 'utf8')); }
+      catch { return send(res, 503, { ok: false, error: 'state sedang ditulis, coba lagi' }); }
+      const policy = require('../paper-entry-policy'), ph = require('../paper-history');
+      const book = st.books?.N5 || Object.values(st.books || {})[0] || {};
+      const rows = policy.visible(book.history, policy.readArchivePolicy(paperDir)).map((r) => ({
+        capitalAsset: r.capitalAsset || 'USDC', capitalInSol: r.initialCapitalInSol || r.capitalInSol, pnlCapital: r.pnlCapital, pnlCapitalPct: r.pnlCapitalPct,
+        name: r.name, pool: r.pool, mintX: r.mintX, closedAt: r.closedAt, openedAt: r.openedAt, reason: r.reason,
+        closeReasonText: r.closeReasonText || ph.closeReason(r), openSource: r.openSource, openReason: r.openReason, openContext: r.openContext,
+        currentLegOpenContext: r.currentLegOpenContext, entryLegs: r.entryLegs, corrected: r.corrected,
+        correction: r.correction ? { ...r.correction, original: { pnlQuote: r.correction.original?.pnlQuote, pnlQuoteUsd: r.correction.original?.pnlQuoteUsd, pnlUsd: r.correction.original?.pnlUsd, usdcOut: r.correction.original?.usdcOut } } : undefined,
+        usdcIn: r.usdcIn, usdcOut: r.usdcOut, pnlQuote: r.pnlQuote, pnlQuoteUsd: r.pnlQuoteUsd, quoteSymbol: r.quoteSymbol,
+        pnlUsd: r.pnlUsd ?? r.netPnlUsd, pnlPct: r.pnlPct ?? r.netPnlPct, swapCostUsd: r.swapCostUsd, gasUsedSol: r.gasUsedSol, hold: r.hold,
+      }));
+      const changes = [];
+      try {
+        for (const line of fs.readFileSync(path.join(paperDir, 'settings-audit.log'), 'utf8').split('\n')) {
+          const m = line.match(/^\[(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d) WIB\] uid=\d+ action=(update|reset\S*)\s*(.*)$/);
+          if (m) changes.push({ at: new Date(m[1].replace(' ', 'T') + '+07:00').toISOString(), wib: m[1] + ' WIB', action: m[2], text: m[3].slice(0, 300) });
+        }
+      } catch { /* no settings log yet */ }
+      return send(res, 200, { ok: true, rows, settingsChanges: changes });
+    }
     if (req.method === 'GET' && (pathname === '/api/settings' || pathname === '/api/status' || pathname === '/api/wallet' || pathname === '/api/live' || pathname === '/api/wallet/rent')) {
       const gate = authInit(req, { initData: url.searchParams.get('initData') || req.headers['x-telegram-init-data'] });
       if (!gate.ok) return send(res, gate.status, { ok: false, error: gate.error, reason: gate.reason, locked: locked() });
@@ -316,6 +343,12 @@ function createApp(opts = {}) {
     catch (e) {
       if (e.code === 'TOO_LARGE') return send(res, 413, { ok: false, error: 'body too large' });
       return send(res, 400, { ok: false, error: 'invalid json' });
+    }
+
+    // PATCHED (local audit): paper-only deployment. The public mini app must never accept a
+    // private key or switch the bot to live. Remove this block only on a deliberate go-live.
+    if (pathname === '/api/wallet' || pathname === '/api/wallet/rent/claim' || pathname === '/api/live/arm' || pathname === '/api/live/start') {
+      return send(res, 403, { ok: false, error: 'disabled: paper-only deployment' });
     }
 
     const writeRoutes = new Set([
