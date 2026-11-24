@@ -1,0 +1,253 @@
+--- pristine-v1/telegram-notify.js	2026-11-13 21:31:56.000000000 +0000
++++ patched-v1/telegram-notify.js	2026-11-24 17:49:02.893379433 +0000
+@@ -307,8 +307,34 @@
+   });
+ }
+ 
++// Item 4a: every send outcome is appended to <instance-root>/alerts.jsonl so the
++// 6-hourly check can read the last-alert timestamp (the notifier previously kept
++// no record at all — a dead Telegram path was invisible). Best-effort only: this
++// must never break alerting. Rotated at ~200KB (keeps the last 1000 lines).
++const ALERT_LOG_FILE = process.env.TELEGRAM_ALERT_LOG_FILE || path.join(ROOT, 'alerts.jsonl');
++function recordAlertOutcome(res) {
++  try {
++    const line = JSON.stringify({ ts: new Date().toISOString(), ok: !!(res && res.ok), error: (res && res.error) || null, skipped: (res && res.skipped) || null, messageId: (res && res.messageId) || null }) + '\n';
++    fs.appendFileSync(ALERT_LOG_FILE, line);
++    try {
++      if (fs.statSync(ALERT_LOG_FILE).size > 200000) {
++        const lines = fs.readFileSync(ALERT_LOG_FILE, 'utf8').trim().split('\n');
++        fs.writeFileSync(ALERT_LOG_FILE, lines.slice(-1000).join('\n') + '\n');
++      }
++    } catch { /* rotation is best-effort */ }
++  } catch { /* alert logging must never break alerting */ }
++}
++function lastAlert() {
++  try {
++    const lines = fs.readFileSync(ALERT_LOG_FILE, 'utf8').trim().split('\n').filter(Boolean);
++    if (!lines.length) return null;
++    return JSON.parse(lines[lines.length - 1]);
++  } catch { return null; }
++}
++
+ function send(text, opts = {}) {
+   if (queueLen >= MAX_QUEUE) {
++    recordAlertOutcome({ ok: false, skipped: 'notify queue full' });
+     return Promise.resolve({ ok: false, skipped: 'notify queue full' });
+   }
+   queueLen += 1;
+@@ -316,6 +342,7 @@
+     const wait = lastSentAt + MIN_GAP_MS - Date.now();
+     if (wait > 0) await new Promise((r) => setTimeout(r, wait));
+     const res = await postSendMessage(text, opts);
++    recordAlertOutcome(res);
+     lastSentAt = Date.now();
+     return res;
+   }).catch((e) => ({ ok: false, error: redact(e && e.message) }))
+@@ -415,6 +442,7 @@
+     const wait = lastSentAt + MIN_GAP_MS - Date.now();
+     if (wait > 0) await new Promise((r) => setTimeout(r, wait));
+     const res = await postSendPhoto(caption, png, opts);
++    recordAlertOutcome(res);
+     lastSentAt = Date.now();
+     return res;
+   }).catch((e) => ({ ok: false, error: redact(e && e.message) }))
+@@ -600,6 +628,8 @@
+     '',
+     dryRunLpAgentNote(),
+   ];
++  if (arguments[0]?.sigs?.length) lines.splice(lines.length - 1, 0, `🔗 Tx: ${shortSigList(arguments[0].sigs)}`);
++  if (arguments[0]?.runningRealisedUsd != null) lines.splice(lines.length - 1, 0, `📈 Realisasi kumulatif (live): ${fmtUsd(arguments[0].runningRealisedUsd)}`);
+   const arguments_ = arguments[0] || {};
+   return fireWithChart(lines.join('\n'), arguments_, { reply_markup: poolKeyboard(pool) });
+ }
+@@ -618,16 +648,27 @@
+     '',
+     dryRunLpAgentNote(),
+   ];
++  if (arguments[0]?.errors?.length) lines.splice(lines.length - 1, 0, `⚠️ Error reshape: ${arguments[0].errors.join(' | ')}`);
++  if (arguments[0]?.sigs?.length) lines.splice(lines.length - 1, 0, `🔗 Tx: ${shortSigList(arguments[0].sigs)}`);
+   return fireWithChart(lines.join('\n'), arguments[0] || {}, { reply_markup: poolKeyboard(pool) });
+ }
+ 
+ function notifyReposition(e={}){
+  const lines=[`🔁 ${PREFIX} Tuan, reposition kanan #${e.number}.`,`🪙 Pair: ${e.name}`,`🧾 Alasan: ${e.reason}`,...openReasonLines(e.openContext),`PnL LP net quote: ${quotePnl.format(e)}`,quotePnl.solChange(e),e.capitalAsset==='SOL'?`PnL net SOL (aturan risiko): ${fmtNum(e.pnlCapital,6)} SOL (${fmtNum(e.pnlPct,3)}%); USD ${fmtUsd(e.pnlUsd)}`:`PnL net USDC (aturan risiko): ${fmtUsd(e.pnlUsd)} (${fmtNum(e.pnlPct,3)}%)`,`Range baru: ${e.minBinId}..${e.maxBinId}; active ${e.activeBin}`,`Swap, gas, rent dihitung; PnL lama diteruskan, batas hold tidak direset.`,dryRunLpAgentNote()];
++ // Item 4a fix N2: render the leg sigs + running realised when the caller passes them (same splice pattern as notifyOpen/notifyReshape).
++ // REVIEW.md §2.3c cited telegram-notify.js:631 for this rendering, but that line is inside notifyOpen — notifyReposition rendered neither until this fix.
++ if (e.sigs?.length) lines.splice(lines.length - 1, 0, `🔗 Tx: ${shortSigList(e.sigs)}`);
++ if (e.runningRealisedUsd != null) lines.splice(lines.length - 1, 0, `📈 Realisasi kumulatif (live): ${fmtUsd(e.runningRealisedUsd)}`);
+  return fireWithChart(lines.join('\n'),e,{reply_markup:poolKeyboard(e.pool)});
+ }
+ 
++function shortSigList(sigs) {
++  if (!Array.isArray(sigs) || !sigs.length) return '';
++  return sigs.filter(Boolean).map((s) => { const t = String(s); return t.length > 12 ? t.slice(0, 8) + '…' + t.slice(-4) : t; }).join(', ');
++}
++
+ function closeBody(rec, title) {
+-  const reason=rec?.closeReasonText||require('./paper-history').closeReason(rec||{});
++  const reason=rec?.closeReasonText||(rec?.reason === 'STOP file' ? 'STOP file — kill switch (posisi ditutup, proses berhenti setelah flat)' : require('./paper-history').closeReason(rec||{}));
+   return [
+     title,
+     '',
+@@ -643,6 +684,10 @@
+     rec && rec.gasUsedSol != null ? `⛽ Gas/rent terpakai: ${fmtNum(rec.gasUsedSol, 6)} SOL` : '',
+     rec && rec.feesEarnedUsd != null ? `🌾 Fee: ${fmtUsd(rec.feesEarnedUsd)} (${fmtNum(rec.feesEarnedQuote,6)} ${rec.quoteSymbol||'SOL'})` : `🌾 Fee: ${fmtNum(rec && rec.feesEarnedSol,6)} SOL`,
+     rec && rec.reshapes != null ? `🔄 Reshape: ${rec.reshapes}` : '',
++    rec && rec.quoted === false ? '⚠️ Valuasi: estimasi on-chain (quote Jupiter tidak tersedia saat exit diputuskan)' : '',
++    rec && rec.swapBackComplete === false ? '⚠️ Swap-back TIDAK lengkap: ' + (rec.swapBackErrors || []).join(' | ') + ' — sisa tetap di wallet' : '',
++    rec && rec.sigs?.length ? `🔗 Tx: ${shortSigList(rec.sigs)}` : '',
++    rec && rec.runningRealisedUsd != null ? `📈 Realisasi kumulatif (live): ${fmtUsd(rec.runningRealisedUsd)}` : '',
+   ].filter(Boolean).join('\n');
+ }
+ 
+@@ -657,6 +702,51 @@
+   return fire(text, { reply_markup: poolKeyboard(rec && rec.pool) });
+ }
+ 
++// Item 4a: kill-switch event alert (STOP / NO_NEW seen by the live cycle).
++// The per-position closes alert separately with reason 'STOP file'; this is the
++// event-level alert. Called once per episode by bot.js (state flags).
++function notifyKillSwitch({ kind = 'STOP', openCount = 0, positions = [] } = {}) {
++  const lines = [
++    `🛑 ${PREFIX} Tuan, kill switch: ${kind} ditulis.`,
++    '',
++    `Posisi terbuka saat ini: ${openCount}${positions.length ? ' (' + positions.join(', ') + ')' : ''}`,
++    kind === 'STOP'
++      ? 'Posisi ditutup lewat jalur normal (alasan STOP file); proses berhenti setelah flat.'
++      : 'Tidak ada posisi baru dibuka; posisi terbuka tetap dikelola sampai exit normal.',
++    `Waktu: ${wib()}`,
++  ];
++  return fire(lines.join('\n'));
++}
++
++// Item 4a: halt / circuit-breaker trip (and manual reset) alert.
++// This function ONLY sends the alert. The trip detection, latch, STOP/NO_NEW
++// writes and reset procedure are Item 1 (plan §3.1) — Item 1 calls this at its
++// trip point with { criterion, figures }; see CALL-SITE-MAP.md §5 for the exact
++// insertion points. Until Item 1 lands, this function has no caller.
++function notifyHalt({ criterion = '?', figures = '', reset = false } = {}) {
++  const lines = [
++    reset ? `✅ ${PREFIX} Tuan, halt ${criterion} di-RESET manual.` : `🛑 ${PREFIX} Tuan, HALT trip: ${criterion}.`,
++    '',
++    figures ? `Angka: ${figures}` : '',
++    reset ? 'Open baru diizinkan lagi setelah reset ini.' : 'STOP / NO_NEW ditulis oleh kode halt; tidak ada open baru sampai reset manual.',
++    `Waktu: ${wib()}`,
++  ].filter(Boolean);
++  return fire(lines.join('\n'));
++}
++
++// Item 4a: feed-degradation reporting alert (3 consecutive stale SOL/USD reads).
++// Reporting only: the no-open rule + NO_NEW write are Item 1 (plan §3.1.7).
++function notifyFeedDegraded({ stalePollsConsecutive = 0, coingecko429 = 0, jupiter429 = 0, lastFreshPriceAt = null } = {}) {
++  const lines = [
++    `⚠️ ${PREFIX} Tuan, feed-degraded: harga SOL/USD stale ${stalePollsConsecutive} poll berturut-turut.`,
++    '',
++    `CoinGecko 429/jam: ${coingecko429} · Jupiter 429/jam: ${jupiter429}`,
++    lastFreshPriceAt ? `Harga segar terakhir: ${lastFreshPriceAt}` : 'Belum ada harga segar.',
++    'Ini alert pelaporan (Item 4a). Aturan no-open-on-stale-feed + NO_NEW adalah Item 1 — belum aktif.',
++  ];
++  return fire(lines.join('\n'));
++}
++
+ function notifyError(err, kind = 'error') {
+   const key = kind + ':' + redact(err && (err.message || err)).slice(0, 80);
+   const now = Date.now();
+@@ -670,12 +760,24 @@
+     `${PREFIX} Tuan, bot ${kind}.`,
+     '',
+     brief || '(tidak ada detail)',
+-    kind === 'cycle error' ? 'Masih jalan, retry ~15 detik. Live tidak dijalankan.' : 'Cek log paper/bot.log. Live tidak dijalankan.',
++    kind === 'cycle error' ? 'Masih jalan, retry ~15 detik.' + (IS_LIVE ? '' : ' Live tidak dijalankan.') : (IS_LIVE ? 'Cek log bot.log.' : 'Cek log paper/bot.log. Live tidak dijalankan.'),
+   ].join('\n');
+   return fire(text);
+ }
+ 
+ function notifyStartup(status = {}) {
++  if (status.live) {
++    const lines = [
++      `${PREFIX} Bot LP Sol Warlock v1.8 LIVE dimulai`,
++      '',
++      status.wallet ? `Wallet: ${status.wallet}` : '',
++      `Posisi terbuka: ${status.openCount || 0}`,
++      status.pnlTotalUsd != null ? `Realisasi kumulatif: ${fmtUsd(status.pnlTotalUsd)}` : '',
++      `STOP: ${status.stopPresent ? 'ADA — live terkunci sampai STOP dilepas' : 'tidak ada'}`,
++      `Waktu: ${wib()}`,
++    ].filter(Boolean);
++    return fire(lines.join('\n'));
++  }
+   const pos = status.position;
+   const scan = status.lastScan;
+   const rej = scan && scan.rejects ? Object.entries(scan.rejects).map(([k, v]) => `${k} ${v}`).join(', ') : '';
+@@ -717,11 +819,13 @@
+     `Modal: ${status.capitalAsset==='SOL'?fmtNum(status.freeCapitalSol,6)+' SOL':status.virtualUsdc != null ? fmtUsd(status.virtualUsdc) : (status.virtualCashSol != null ? fmtNum(status.virtualCashSol, 4) + ' SOL' : 'n/a')}${status.leftoverSol ? ` + ${fmtNum(status.leftoverSol, 4)} SOL sisa buffer` : ''}`,
+     `PnL posisi open (quote → USD): ${fmtUsd(status.quotePnlTotals?.usd)}`,
+     ...Object.entries(status.quotePnlTotals?.quotes||{}).map(([q,n])=>`${q}-pool: ${fmtNum(n,q==='SOL'?4:2)} ${q}`),
+-    ...(status.positions||[]).map(p=>`${p.name} [modal ${p.capitalAsset||'USDC'}]: ${quotePnl.format(p)}${quotePnl.solChange(p)?' · '+quotePnl.solChange(p):''}`),
++    ...(status.positions||[]).map(p=>{ const q=quotePnl.format(p); return `${p.name} [modal ${p.capitalAsset||'USDC'}]${q && q!=='PnL quote belum tersedia' ? ': '+q : ''}${quotePnl.solChange(p)?' · '+quotePnl.solChange(p):''}`; }),
+     'Aturan exit mengikuti aset modal masing-masing posisi saat entry (USDC/SOL).',
+     `Aset modal aktif: ${status.capitalAsset||'USDC'} · equity ${fmtNum(status.equitySol,6)} SOL · deposit basis ${fmtNum(status.totalDepositedSol,6)} SOL`,
+     `Equity: ${fmtUsd(status.equityUsd)} · modal disetor: ${fmtUsd(status.totalDepositedUsdc)}`,
+     `Posisi ${status.openCount||0}/${status.maxPositions||5}: ${(status.positions||[]).map(p=>p.name||p.pool).join(', ')||'tidak ada'}`,
++    status.live && status.feedHealth ? `📡 Feed/jam: CoinGecko 429 ${status.feedHealth.coingecko429} · Jupiter 429 ${status.feedHealth.jupiter429} · stale poll ${status.feedHealth.stalePolls} · quote-wait ${status.feedHealth.quoteWaits} (maks ${status.feedHealth.quoteWaitMaxPolls} poll)` : '',
++    status.live ? (status.feesPaidUsd != null ? `💸 Fee dibayar: ${fmtUsd(status.feesPaidUsd)}` : '💸 Fee dibayar: tidak dicatat per leg (live rows tidak menyimpan biaya swap/gas)') : '',
+     `Window sampai: ${status.endsWib || 'n/a'}`,
+   ];
+   return fire(lines.join('\n')).then((res) => {
+@@ -805,6 +909,39 @@
+   };
+ }
+ 
++// Item 4a: daily-heartbeat / startup status for the LIVE instance. The paper
++// statusFromState reads state.books.N5, which a live state does not have —
++// passing a live state to it would report zero trades and zero PnL. Live state
++// is positions[] + history[]; realised P&L is the sum of history pnlUsd.
++// feesPaidUsd is null by design (gap G-6: live rows record no swap/gas costs).
++function statusFromLiveState(state, extra = {}) {
++  const hist = (state && state.history) || [];
++  const positions = Array.isArray(state && state.positions) ? state.positions
++    : (state && state.position ? [state.position] : []);
++  const today = wibDate();
++  const todays = hist.filter((h) => {
++    try { return wibDate(new Date(h.closedAt)) === today; } catch { return false; }
++  });
++  const sumUsd = (rows) => rows.reduce((s, h) => s + (+(h.pnlUsd != null ? h.pnlUsd : h.netPnlUsd) || 0), 0);
++  return {
++    live: true,
++    startedWib: null, endsWib: null,
++    capitalAsset: 'USDC', virtualUsdc: null, leftoverSol: null,
++    equityUsd: null, totalDepositedUsdc: null,
++    positions: positions.map((p) => ({ capitalAsset: p.capitalAsset || 'USDC', name: p.name, pool: p.pool, entryWib: p.entryWib })),
++    quotePnlTotals: { usd: null, quotes: {} },
++    openCount: positions.length, maxPositions: extra.maxPositions || 5,
++    trades: hist.length, tradesToday: todays.length,
++    pnlToday: null, pnlTotal: null,
++    pnlTodayUsd: sumUsd(todays), pnlTotalUsd: sumUsd(hist),
++    realizedPnlTotalUsd: sumUsd(hist),
++    feesPaidUsd: null,
++    feedHealth: extra.feedHealth || null,
++    stopPresent: !!extra.stopPresent,
++    wallet: extra.wallet || null,
++  };
++}
++
+ function notifyCapitalChange({ usdcStart, gasBufferSol, gasNeeded, gasRaw, solUsd, startedWib, endsWib, switchedWib } = {}) {
+   const lines = [
+     `${PREFIX} Modal diubah: ${usdcStart != null ? usdcStart : 500} USDC (swap SOL dilebihkan untuk gas/rent)`,
+@@ -971,6 +1108,11 @@
+   notifyRestart,
+   notifyDailySummary,
+   notifyWindowEnd,
++  notifyKillSwitch,
++  notifyHalt,
++  notifyFeedDegraded,
++  statusFromLiveState,
++  lastAlert,
+   maybeDailySummary,
+   dailyDue,
+   installProcessHandlers,
+@@ -981,4 +1123,5 @@
+   loadToken,
+   SECRET_FILE,
+   CFG_FILE,
++  ALERT_LOG_FILE,
+ };

@@ -1,0 +1,263 @@
+--- pristine-v1/bot.js	2026-11-23 16:24:33.000000000 +0000
++++ patched-v1/bot.js	2026-11-24 17:48:50.858021619 +0000
+@@ -17,6 +17,7 @@
+ const reshapeCore = require('./reshape-core');
+ const antirug = require('./antirug');
+ const telegram = require('./telegram-notify');
++const feedHealth = require('./feed-health');   // Item 4a: feed-health counters (reporting only; the stale-feed RULES are Item 1)
+ const paperCap = require('./paper-capital');
+ const paperSettings = require('./paper-settings');
+ const antiPvp = require('./anti-pvp');
+@@ -247,17 +248,20 @@
+ 
+ let solUsdCache = { t: 0, px: 0 };
+ async function solUsd() {
+-  if (Date.now() - solUsdCache.t < 60_000 && solUsdCache.px) return solUsdCache.px;
++  // Item 4a: feed-health counts. A cache hit (<60s) is a fresh price; a failed
++  // fetch that falls back to an older cached price (or 0) is a stale read.
++  if (Date.now() - solUsdCache.t < 60_000 && solUsdCache.px) { try { feedHealth.recordFreshPrice(); } catch {} return solUsdCache.px; }
+   try {
+     const j = await getJSON('https://api.coingecko.com/api/v3/simple/price?ids=solana&vs_currencies=usd', {}, 2);
+     const px = +j?.solana?.usd;
+-    if (px > 0) { solUsdCache = { t: Date.now(), px }; return px; }
+-  } catch (e) { log('coingecko sol usd: ' + e.message); }
++    if (px > 0) { solUsdCache = { t: Date.now(), px }; try { feedHealth.recordFreshPrice(); } catch {} return px; }
++  } catch (e) { log('coingecko sol usd: ' + e.message); try { if (/429/.test(e.message)) feedHealth.recordCoingecko429(); } catch {} }
+   try {
+     const j = await getJSON('https://api.dexscreener.com/latest/dex/tokens/' + SOL, {}, 2);
+     const px = +(j?.pairs?.[0]?.priceUsd || 0);
+-    if (px > 0) { solUsdCache = { t: Date.now(), px }; return px; }
++    if (px > 0) { solUsdCache = { t: Date.now(), px }; try { feedHealth.recordFreshPrice(); } catch {} return px; }
+   } catch (e) { log('dexscreener sol usd: ' + e.message); }
++  try { feedHealth.recordStalePoll(Date.now() - solUsdCache.t); } catch {}
+   return solUsdCache.px || 0;
+ }
+ 
+@@ -1710,6 +1714,7 @@
+     const parsed = paperCap.parseQuote(q, inDec, outDec);
+     return Object.assign(q, parsed);
+   } catch (e) {
++    try { if (/429/.test(e.message)) feedHealth.recordJupiter429(); } catch {}   // Item 4a
+     return { ok: false, error: e.message, inUi: 0, outUi: 0 };
+   }
+ }
+@@ -2013,6 +2018,47 @@
+   return sig;
+ }
+ 
++
++// ---------- live Telegram alerts (Item 4a) ----------
++// Live state has no paper books: realised P&L is the sum of live history rows.
++function liveRealisedUsd(state) {
++  return (state.history || []).reduce((s, h) => s + (+(h.pnlUsd != null ? h.pnlUsd : h.netPnlUsd) || 0), 0);
++}
++function feedHealthStatus() { try { return feedHealth.status(); } catch { return null; } }
++// Minimal screening snapshot for the open alert. Live positions carry no paper
++// openContext, and quotePnl.fromPosition must NOT be used on live positions:
++// they have no bins, so it would value the position at 0 (a fake huge loss).
++function liveOpenContext(p, opts = {}) {
++  return { source: opts.source === 'reposition' ? 'Reposition (auto)' : 'Auto bot (scan)',
++    reason: 'Lolos screening bot',
++    snapshot: { capitalAsset: 'USDC', capitalInSol: null, ft30mPct: null, tvlUsd: p.tvl ?? null,
++      ageH: null, binStep: p.pool_config?.bin_step ?? null, marketCapUsd: null,
++      quote: p.token_y?.symbol || 'SOL', strategy: 'N5',
++      entryCostEstimate: p.entryCostEstimate || null, passedAllFilters: null, failedFilters: [] } };
++}
++function liveRepositionReasonText(pos, val) {
++  try {
++    const a = pos.lastActiveBin ?? pos.entryActiveBin;
++    const pct = val && Number.isFinite(+val.pnlPct) ? (+val.pnlPct).toFixed(3) + '%' : '?';
++    const min = (pos.strategySettings || {}).OOR_RIGHT_MIN_PROFIT_PCT ?? CFG.OOR_RIGHT_MIN_PROFIT_PCT;
++    return `OOR kanan: active bin ${a} > range ${pos.minBinId}..${pos.maxBinId} · PnL leg ${pct} < min profit ${min}%`;
++  } catch { return 'OOR kanan'; }
++}
++// Fire-and-forget on purpose (paper pattern): the alert must never block trading.
++// A failed send is recorded in telegram-notify's alerts.jsonl (see HEARTBEAT doc).
++function liveAlertOpen(state, p, dep, extra = {}) {
++  try {
++    const pos = state.position || {};
++    if (!pos || !(dep && dep.depositedLamports > 0)) return;
++    telegram.notifyOpen({ openContext: pos.openContext || liveOpenContext(p, extra),
++      name: p.name, pool: p.address, sizeSol: pos.depositSol, quoteSymbol: extra.quoteSymbol || 'SOL',
++      depositQuote: pos.depositQuote, usdcIn: pos.usdcIn, gasBufferSol: pos.gasBufferSol,
++      leftoverSol: pos.leftoverSol, minBinId: pos.minBinId, maxBinId: pos.maxBinId,
++      entryPrice: pos.entryPrice, ft30m: extra.ft30m, tvl: p.tvl,
++      sigs: (dep && dep.sigs) || [], runningRealisedUsd: liveRealisedUsd(state) }).catch(() => {});
++  } catch { /* notify must never crash the bot */ }
++}
++
+ async function liveOpen(p, state, opts = {}) {
+   // Same open-time guards as the dry run (paperOpenSingle / paperOpenUsdc); nothing has been sent yet when any of them rejects.
+   const policy = { ...CFG, ...(opts.strategySettings || {}) };   // a reposition keeps the settings the position was opened with, like paperOpenSingle
+@@ -2065,7 +2111,7 @@
+     state.position = { pool: p.address, name: p.name, mintX: p.token_x.address, decX: p.token_x.decimals, position: posKp.publicKey.toBase58(), minBinId, maxBinId, openedAt: now(), entryPrice: priceUi, depositSol: sizing.actual, sizeWant: sizing.want, tvlCapped: sizing.capped, walletBefore: balBefore, usdcIn: swapIn.inUi, solBought: swapIn.outUi, gasBufferSol: extraSol, stage: 'spot', rentPaidSol: rentRef + rentNon, rentRefundableSol: rentRef, spotSol: sizing.actual / 2, bidaskSol: sizing.actual / 2,
+       // everything the shared exit policy needs (same fields the dry run keeps on a position)
+       tvlUsd: p.tvl, binStep, entryActiveBin: active.binId, capitalAsset: 'USDC', quoteMint: SOL, initialUsdcIn: swapIn.inUi, leftoverSol: alloc.reserve,
+-      baseFeePct: p.pool_config?.base_fee_pct ?? p.pool_config?.base_fee_percentage ?? null, strategySettings: opts.strategySettings || strategy.snapshot(CFG), openSource: opts.source || 'scan' };
++      baseFeePct: p.pool_config?.base_fee_pct ?? p.pool_config?.base_fee_percentage ?? null, strategySettings: opts.strategySettings || strategy.snapshot(CFG), openSource: opts.source || 'scan', openContext: liveOpenContext(p, opts) };
+     Object.assign(state.position, { spotSol: sizing.actual * plan.split, bidaskSol: sizing.actual * (1 - plan.split), upperBufferBins: plan.upper, nBins: plan.width, origMinBinId: minBinId, origMaxBinId: maxBinId, shape: 'open-' + String(CFG.OPEN_SHAPE || 'MIXED').toLowerCase() });
+   };
+   const dep = await liveOpenExec.openDeposit({
+@@ -2075,6 +2121,7 @@
+   if (dep.complete) state.position.stage = 'full';
+   else { state.position.depositSol = dep.depositedLamports / LAMPORTS_PER_SOL; state.position.spotSol = Math.min(state.position.spotSol, state.position.depositSol); state.position.bidaskSol = Math.max(0, state.position.depositSol - state.position.spotSol); }
+   saveState(state, path.join(DIR, 'state.json'));
++  if (!opts.intermediate) liveAlertOpen(state, p, dep, { quoteSymbol: 'SOL', ft30m: feeTvl(p, '30m'), source: opts.source });
+   return { opened: true, complete: dep.complete, width: plan.width, wide: plan.wide };
+ }
+ 
+@@ -2101,7 +2148,7 @@
+   const recordPosition = () => {
+     state.position = { pool: p.address, name: p.name, mintX: p.token_x.address, decX: p.token_x.decimals, position: posKp.publicKey.toBase58(), minBinId, maxBinId, openedAt: now(), entryPrice: priceUi, depositSol: pl.depositQuote, tvlCapped: pl.depositQuote >= (p.tvl || 0) * ((policy.MAX_POSITION_TVL_PCT ?? 5) / 100) - 1e-6, walletBefore: balBefore, usdcIn, solBought: bought, gasBufferSol: gas.buffer, stage: 'spot', rentPaidSol: rentRef + rentNon, rentRefundableSol: rentRef,
+       tvlUsd: p.tvl, binStep, entryActiveBin: active.binId, capitalAsset: 'USDC', quoteMint: USDC, quoteSymbol: 'USDC', quoteDecimals: 6, depositQuote: pl.depositQuote, initialUsdcIn: usdcIn, leftoverSol: reserve,
+-      baseFeePct: p.pool_config?.base_fee_pct ?? p.pool_config?.base_fee_percentage ?? null, strategySettings: opts.strategySettings || strategy.snapshot(CFG), openSource: opts.source || 'scan' };
++      baseFeePct: p.pool_config?.base_fee_pct ?? p.pool_config?.base_fee_percentage ?? null, strategySettings: opts.strategySettings || strategy.snapshot(CFG), openSource: opts.source || 'scan', openContext: liveOpenContext(p, opts) };
+     Object.assign(state.position, { spotQuote: pl.depositQuote * plan.split, bidaskQuote: pl.depositQuote * (1 - plan.split), upperBufferBins: plan.upper, nBins: plan.width, origMinBinId: minBinId, origMaxBinId: maxBinId, shape: 'open-' + String(policy.OPEN_SHAPE || 'MIXED').toLowerCase() });
+   };
+   const dep = await liveOpenExec.openDeposit({ dlmm, plan, actualSol: pl.depositQuote, posKp, wallet, send, BN, StrategyType, lamports: 1e6, slippage: CFG.SLIPPAGE_PCT, log,
+@@ -2109,6 +2156,7 @@
+   if (dep.complete) state.position.stage = 'full';
+   else { state.position.depositSol = dep.depositedLamports / 1e6; state.position.depositQuote = state.position.depositSol; }
+   saveState(state, path.join(DIR, 'state.json'));
++  if (!opts.intermediate) liveAlertOpen(state, p, dep, { quoteSymbol: 'USDC', ft30m: feeTvl(p, '30m'), source: opts.source });
+   return { opened: true, complete: dep.complete, usdcPool: true, width: plan.width, wide: plan.wide };
+ }
+ 
+@@ -2154,7 +2202,8 @@
+   if (CFG.DRY_RUN || CFG.PAPER) throw new Error('liveClose called in dry/paper');
+   const solBeforeRemove = await realSolBal(wallet.publicKey);
+   const txs = await v.dlmm.removeLiquidity({ user: wallet.publicKey, position: new PublicKey(pos.position), fromBinId: v.p.positionData.lowerBinId, toBinId: v.p.positionData.upperBinId, bps: new BN(10000), shouldClaimAndClose: true });
+-  for (const [i, tx] of txs.entries()) await send(tx, [wallet], `remove-claim-close ${i + 1}/${txs.length}`);
++  const closeSigs = [];
++  for (const [i, tx] of txs.entries()) closeSigs.push(await send(tx, [wallet], `remove-claim-close ${i + 1}/${txs.length}`));
+   await sleep(3000);
+   const receivedSol = (await realSolBal(wallet.publicKey)) - solBeforeRemove;   // quote side (SOL pools) + refunded rent - close fees
+   // Swap back exactly like the dry run (paper-usdc.exitQuote): token -> USDC directly, then the position's whole SOL pile -> USDC.
+@@ -2175,8 +2224,10 @@
+   log(`  USDC out ${sb.usdcOut.toFixed(4)} for ${basisUsdc.toFixed(4)} in: ${pnlUsd.toFixed(4)} USDC (${pnlPct.toFixed(3)}%); wallet SOL back to ${after.toFixed(4)} (was ${pos.walletBefore.toFixed(4)} before the position)`);
+   // SL blacklist: record every stop-loss close by token mint, exactly like paperClose (the rule controls skipping at screening/open).
+   if (!opts.intermediate && slBlacklist.isStopLoss(reason)) { try { if (slBlacklist.add(PAPER_DIR, { mint: pos.mintX, symbol: pos.name, pool: pos.pool, reason, closedAt: now(), source: 'auto' })) log('SL blacklist add ' + pos.name + ' ' + pos.mintX); } catch (e) { log('SL blacklist add failed: ' + e.message); } }
+-  const row = { ...pos, closedAt: now(), reason, estPnlPct: +(v.pnl * 100).toFixed(2), estValueSol: +v.value.toFixed(5), feesSol: +v.fees.toFixed(5), realizedSol: +realized.toFixed(5), usdcIn: basisUsdc, usdcOut: sb.usdcOut, legUsdcIn: pos.usdcIn, legUsdcOut: sb.usdcOut, pnlUsd, pnlPct, netPnlUsd: pnlUsd, netPnlPct: pnlPct, pnlCapital: pnlUsd, pnlCapitalPct: pnlPct, solPile: sb.solPile, swapBackComplete: sb.complete, swapBackErrors: sb.errors };
++  const row = { ...pos, closedAt: now(), reason, estPnlPct: +(v.pnl * 100).toFixed(2), estValueSol: +v.value.toFixed(5), feesSol: +v.fees.toFixed(5), realizedSol: +realized.toFixed(5), usdcIn: basisUsdc, usdcOut: sb.usdcOut, legUsdcIn: pos.usdcIn, legUsdcOut: sb.usdcOut, pnlUsd, pnlPct, netPnlUsd: pnlUsd, netPnlPct: pnlPct, pnlCapital: pnlUsd, pnlCapitalPct: pnlPct, solPile: sb.solPile, swapBackComplete: sb.complete, swapBackErrors: sb.errors, riskPolicyVersion: 'net-usdc-v2-quote-wait10', quoted: opts.val ? !!opts.val.quoted : null, valuationBasis: opts.val ? (opts.val.valuationBasis || null) : null, closeSigs, sigs: [...closeSigs, ...((sb && sb.sigs) || [])] };
+   if (!opts.intermediate) { state.history.push(row); state.position = null; saveState(state, path.join(DIR, 'state.json')); }
++  row.runningRealisedUsd = liveRealisedUsd(state);
++  if (!opts.intermediate) { try { (reason === 'emergency_stop' ? telegram.notifyEmergency(row) : telegram.notifyClose(row)).catch(() => {}); } catch { /* notify must never crash the bot */ } }
+   log(`  closed${opts.intermediate ? ' (reposition leg)' : ''}. wallet ${after.toFixed(4)} SOL, USDC ${afterUsdc.toFixed(2)}`);
+   return { usdcOut: sb.usdcOut, row };
+ }
+@@ -2218,6 +2269,7 @@
+       stopHow: 'touch /workspace/lp-bot/paper/STOP  (do not remove /workspace/lp-bot/STOP)',
+     } : (root.paperRun || null),
+     lastScan: CFG.PAPER ? undefined : (state.lastScan || root.lastScan),
++    ...(CFG.PAPER ? {} : { feedHealth: feedHealthStatus() }),
+     closedTrades: root.closedTrades || [],
+     totalRealizedSol: root.totalRealizedSol,
+     ...extra,
+@@ -2317,6 +2369,7 @@
+       const pollId = state.livePollSequence = (state.livePollSequence || 0) + 1;
+       const r = await liveExit.decideLiveExit({ pos: state.position, v, pxUsd: await solUsd(), quote: jupiterQuote, txFee: CFG.TX_FEE_SOL, CFG, pollId });
+       live.pnlUsdcPct = +r.val.pnlPct.toFixed(2); live.pnlUsd = +r.val.pnlUsd.toFixed(2); live.quoted = !!r.val.quoted;
++      try { if (r.val && r.val.quoted === false) feedHealth.recordQuoteWait(state.position.quoteUnavailablePolls || 0); } catch { /* feed-health reporting must never break the cycle */ }
+       exitReason = r.reason; decisionVal = r.val; state.position.lastLive = { pnlPct: live.pnlUsdcPct };
+     } catch (e) { log('exit decision error (position held, retry next poll): ' + e.message); }
+     if (exitReason === 'oor_right_reposition') {
+@@ -2325,7 +2378,17 @@
+         const rr = await liveRepositionExec.reposition({ state, val: decisionVal, settings: { ...CFG, ...(state.position.strategySettings || {}) }, pxUsd: await solUsd(),
+           deps: { log, fetchPool, sanityReason: screenSource.sanityReason, closeLeg: s2 => liveClose(s2, 'oor_right_reposition_leg', { intermediate: true }), openNew: (pool, o) => liveOpen(pool, state, o) } });
+         saveState(state, path.join(DIR, 'state.json'));
+-        if (rr.done) return live;
++        if (rr.done) {
++          try {
++            if (rr.reopened && rr.leg && rr.leg.row) {
++              const legRow = rr.leg.row, np = state.position;
++              telegram.notifyReposition({ number: rr.number, name: np.name, pool: np.pool, reason: liveRepositionReasonText(np, decisionVal), openContext: np.openContext, pnlCapital: legRow.pnlCapital, pnlPct: legRow.pnlPct, pnlUsd: legRow.pnlUsd, sigs: legRow.sigs, runningRealisedUsd: liveRealisedUsd(state), minBinId: np.minBinId, maxBinId: np.maxBinId, activeBin: np.entryActiveBin, capitalAsset: 'USDC', quoteSymbol: 'USDC', shape: np.shape }).catch(() => {});   // Item 4a fix N2: leg sigs + running realised (failed-reopen path already passed runningRealisedUsd via notifyClose)
++            } else if (!rr.reopened && rr.row) {
++              telegram.notifyClose({ ...rr.row, runningRealisedUsd: liveRealisedUsd(state) }).catch(() => {});
++            }
++          } catch { /* notify must never crash the bot */ }
++          return live;
++        }
+       } catch (e) { log('reposition error (position held if still open, retry next poll): ' + e.message); }
+     }
+     // Reshape / compound: same trigger, guard and steps as paperReshape (live-reshape-exec.js). Runs only when the exit policy did not close the position.
+@@ -2345,22 +2408,25 @@
+             pos0.shape = pol.RESHAPE_SHAPE === 'SPOT' ? 'reshape-spot' : 'M-double-bidask';
+             saveState(state, path.join(DIR, 'state.json'));
+             log(`  RESHAPE #${pos0.reshapes} ${pos0.name}: right=${ev.range.rightMin}..${ev.range.rightMax} token re-add X=${ev.amountX} compounded=${(ev.compounded || 0).toFixed(6)} ${ev.errors.length ? 'ERRORS: ' + ev.errors.join(' | ') : ''}`);
++            try { telegram.notifyReshape({ name: pos0.name, pool: pos0.pool, n: pol.RESHAPE_N ?? 5, reshapes: pos0.reshapes, activeBin: v.activeBinId, rightMin: ev.range.rightMin, rightMax: ev.range.rightMax, amountX: ev.amountX, feeXAdded: ev.feeXAdded, feeYAdded: ev.compounded, sigs: ev.sigs || [], errors: ev.errors || [] }).catch(() => {}); } catch { /* notify must never crash the bot */ }
+             // like the dry run: re-value after the reshape and decide again with the same policy
+             const v2 = await liveValuation(pos0), pollId2 = state.livePollSequence = (state.livePollSequence || 0) + 1;
+             const r2 = await liveExit.decideLiveExit({ pos: pos0, v: v2, pxUsd: await solUsd(), quote: jupiterQuote, txFee: CFG.TX_FEE_SOL, CFG, pollId: pollId2 });
++            try { if (r2.val && r2.val.quoted === false) feedHealth.recordQuoteWait(pos0.quoteUnavailablePolls || 0); } catch { /* feed-health reporting must never break the cycle */ }
+             exitReason = r2.reason === 'oor_right_reposition' ? null : r2.reason;
+           }
+         }
+       } catch (e) { log('reshape error (position held, retry next poll): ' + e.message); }
+     }
+   }
+-  if (exitReason) await liveClose(state, exitReason);
++  if (exitReason) await liveClose(state, exitReason, { val: decisionVal });
+   else saveState(state, path.join(DIR, 'state.json'));   // persist peak / TP-emergency / SL+ state exactly like the dry run
+   return live;
+ }
+ 
+ async function liveCycle(state) {
+   applyPaperSettings();
++  await solUsd();   // Item 4a: one price read per cycle so the feed-health stale counter advances even with no open position (cached <60s, so at most 1 fetch/min)
+   const stop = fs.existsSync(path.join(DIR, 'STOP'));
+   const noNew = fs.existsSync(path.join(DIR, 'NO_NEW'));
+   state.positions = livePositions.list(state).slice(); state.position = null; state.__active = null;
+@@ -2371,6 +2437,30 @@
+   }
+   saveState(state, path.join(DIR, 'state.json'));
+   if (state.positions.length) await writeLiveStatusPointer(state, { live: lives[0], lives });
++  // Item 4a: kill-switch / pause events alert once per episode. The per-position
++  // close alerts carry the reason; this is the event-level alert. Flags persist
++  // in state, so a restart re-alerts only if the file is still present.
++  if (stop && !state.killSwitchNotified) {
++    state.killSwitchNotified = { kind: 'STOP', at: now() }; saveState(state, path.join(DIR, 'state.json'));
++    try { telegram.notifyKillSwitch({ kind: 'STOP', openCount: state.positions.length, positions: state.positions.map(p => p.name) }).catch(() => {}); } catch { /* notify must never crash the bot */ }
++  }
++  if (!stop && state.killSwitchNotified) { state.killSwitchNotified = null; saveState(state, path.join(DIR, 'state.json')); }
++  if (noNew && !state.noNewNotified) {
++    state.noNewNotified = { at: now() }; saveState(state, path.join(DIR, 'state.json'));
++    try { telegram.notifyKillSwitch({ kind: 'NO_NEW', openCount: state.positions.length, positions: state.positions.map(p => p.name) }).catch(() => {}); } catch { /* notify must never crash the bot */ }
++  }
++  if (!noNew && state.noNewNotified) { state.noNewNotified = null; saveState(state, path.join(DIR, 'state.json')); }
++  // Item 4a: feed-health reporting alert (3 consecutive stale SOL/USD reads).
++  // Reporting only: the no-open rule + NO_NEW write are Item 1 (plan §3.1.7).
++  try {
++    const fh = feedHealth.status();
++    if (fh.stalePollsConsecutive >= 3 && !state.feedDegradedNotified) {
++      state.feedDegradedNotified = { at: now(), stalePolls: fh.stalePollsConsecutive }; saveState(state, path.join(DIR, 'state.json'));
++      telegram.notifyFeedDegraded(fh).catch(() => {});
++    } else if (fh.stalePollsConsecutive === 0 && state.feedDegradedNotified) {
++      state.feedDegradedNotified = null; saveState(state, path.join(DIR, 'state.json'));
++    }
++  } catch { /* feed-health reporting must never break the cycle */ }
+   if (stop) { if (state.positions.length) return false; log('STOP file present, no position -> exiting'); await writeLiveStatusPointer(state); return true; }   // exit only when flat
+   if (noNew) {
+     log('NO_NEW present: not opening a new live position (existing holds would still be managed)');
+@@ -2505,13 +2595,21 @@
+   wallet = loadWallet();
+   log(`start: wallet ${wallet.publicKey.toBase58()} rpc=[configured] DRY_RUN=${CFG.DRY_RUN} LIVE_CONFIRMED=${process.env.LIVE_CONFIRMED === '1'} balance=${(await realSolBal(wallet.publicKey)).toFixed(5)} SOL`);
+   const state = loadState(path.join(DIR, 'state.json'));
++  // Item 4a: live startup alert + crash handlers (paper branch already has both).
++  try { telegram.installProcessHandlers(); } catch { /* ignore */ }
++  try {
++    const nr = await telegram.notifyStartup(telegram.statusFromLiveState(state, { wallet: REAL_WALLET, stopPresent: fs.existsSync(path.join(DIR, 'STOP')), maxPositions: CFG.MAX_POSITIONS, feedHealth: feedHealth.status() }));
++    log(nr && nr.ok ? 'telegram startup notify delivered' : `telegram startup notify not sent${nr && nr.skipped ? ' (' + nr.skipped + ')' : (nr && nr.error ? ' (' + nr.error + ')' : '')}`);
++  } catch (e) { log('telegram startup notify failed (bot continues)'); }
+   while (true) {
+     let exit = false;
+     try { exit = await liveCycle(state); }
+-    catch (e) { log('cycle error: ' + (e.stack || e.message).split('\n').slice(0, 3).join(' / ')); }
++    catch (e) { log('cycle error: ' + (e.stack || e.message).split('\n').slice(0, 3).join(' / ')); try { telegram.notifyError(e, 'cycle error').catch(() => {}); } catch { /* ignore */ } }
+     if (exit || CFG.ONCE) break;
+     for (let i = 0; i < CFG.POLL_SEC / 5; i++) {
+       await sleep(5000);
++      // Item 4a: daily heartbeat (21:00 WIB, via maybeDailySummary's own gate).
++      try { telegram.maybeDailySummary(telegram.statusFromLiveState(state, { wallet: REAL_WALLET, stopPresent: fs.existsSync(path.join(DIR, 'STOP')), maxPositions: CFG.MAX_POSITIONS, feedHealth: feedHealth.status() })).catch(() => {}); } catch { /* ignore */ }
+       if (fs.existsSync(path.join(DIR, 'STOP'))) break;
+     }
+   }

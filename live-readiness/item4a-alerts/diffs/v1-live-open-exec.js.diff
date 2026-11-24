@@ -1,0 +1,44 @@
+--- pristine-v1/live-open-exec.js	2026-11-13 20:57:58.000000000 +0000
++++ patched-v1/live-open-exec.js	2026-11-24 16:51:13.941643510 +0000
+@@ -10,27 +10,27 @@
+   if (bidLam > 0) parts.push({ type: StrategyType.BidAsk, name: 'bidask', lam: bidLam });
+   if (!parts.length) throw new Error('nothing to deposit');
+   const paramsFor = part => ({ positionPubKey: posKp.publicKey, totalXAmount: new BN(0), totalYAmount: new BN(part.lam), strategy: { minBinId: plan.minBinId, maxBinId: plan.maxBinId, strategyType: part.type }, user: wallet.publicKey, slippage });
+-  let deposited = 0, complete = true, created = false;   // created = the position exists on chain
++  let deposited = 0, complete = true, created = false, sigs = [];   // Item 4a: sigs of the deposit txs, for the open alert
+   for (const [i, part] of parts.entries()) {
+     const params = paramsFor(part);
+     try {
+       if (i === 0) {
+         if (!plan.wide) {
+           const tx = await dlmm.initializePositionAndAddLiquidityByStrategy(params);
+-          await send(tx, [wallet, posKp], 'open-' + part.name); created = true;
++          sigs.push(await send(tx, [wallet, posKp], 'open-' + part.name)); created = true;
+         } else {
+           const tx0 = await dlmm.createExtendedEmptyPosition(plan.minBinId, plan.maxBinId, posKp.publicKey, wallet.publicKey);
+-          await send(tx0, [wallet, posKp], 'open-extended-empty'); created = true;
++          sigs.push(await send(tx0, [wallet, posKp], 'open-extended-empty')); created = true;
+           await onCreated({ depositedLamports: 0 });                       // the position exists on chain: record it before depositing
+           const txs = await dlmm.addLiquidityByStrategyChunkable(params);
+-          for (const [j, t] of txs.entries()) await send(t, [wallet], `add-${part.name} ${j + 1}/${txs.length}`);
++          for (const [j, t] of txs.entries()) sigs.push(await send(t, [wallet], `add-${part.name} ${j + 1}/${txs.length}`));
+         }
+         deposited += part.lam;
+         if (!plan.wide) await onCreated({ depositedLamports: deposited }); // narrow: created together with the first deposit
+         else await onCreated({ depositedLamports: deposited, update: true });
+       } else {
+-        if (!plan.wide) { const tx = await dlmm.addLiquidityByStrategy(params); await send(tx, [wallet], 'add-' + part.name); }
+-        else { const txs = await dlmm.addLiquidityByStrategyChunkable(params); for (const [j, t] of txs.entries()) await send(t, [wallet], `add-${part.name} ${j + 1}/${txs.length}`); }
++        if (!plan.wide) { const tx = await dlmm.addLiquidityByStrategy(params); sigs.push(await send(tx, [wallet], 'add-' + part.name)); }
++        else { const txs = await dlmm.addLiquidityByStrategyChunkable(params); for (const [j, t] of txs.entries()) sigs.push(await send(t, [wallet], `add-${part.name} ${j + 1}/${txs.length}`)); }
+         deposited += part.lam;
+       }
+     } catch (e) {
+@@ -39,6 +39,6 @@
+       complete = false; break;
+     }
+   }
+-  return { complete, depositedLamports: deposited, totalLamports: total, parts: parts.map(p => ({ name: p.name, lam: p.lam })) };
++  return { complete, depositedLamports: deposited, totalLamports: total, parts: parts.map(p => ({ name: p.name, lam: p.lam })), sigs };
+ }
+ module.exports = { openDeposit };

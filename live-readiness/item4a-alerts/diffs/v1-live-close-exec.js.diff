@@ -1,0 +1,26 @@
+--- pristine-v1/live-close-exec.js	2026-11-13 20:57:58.000000000 +0000
++++ patched-v1/live-close-exec.js	2026-11-24 16:51:13.941828458 +0000
+@@ -6,12 +6,12 @@
+ const SWAP_FEE_KEEP = 0.003;   // SOL that must stay to pay the pile swap itself
+ const SOL_DUST = 0.0005;   // below this a swap costs more than it returns (a swap of the pile is skipped only under this)
+ async function swapBack({ pos, pileSol, getToken, swapTokenToUsdc, closeTokenAccounts, getSolBalance, swapSolToUsdc, getUsdcBalance, sleep = async () => {}, log = () => {}, retries = 3 }) {
+-  const out = { usdcBefore: await getUsdcBalance(), tokenSwapped: 0, solSwapped: 0, errors: [] };
++  const out = { usdcBefore: await getUsdcBalance(), tokenSwapped: 0, solSwapped: 0, errors: [], sigs: [] };   // Item 4a: swap sigs, for the close alert
+   const attempt = async (name, fn) => { for (let i = 1; i <= retries; i++) { try { return await fn(); } catch (e) { out.errors.push(`${name} #${i}: ${e.message}`); log(`  ${name} failed (${i}/${retries}): ${e.message}`); await sleep(2000); } } return null; };
+   const tok = await getToken();
+   if (tok && tok.raw > 0n) {
+     const r = await attempt('token->USDC', async () => { const x = await swapTokenToUsdc(tok.raw, tok.decimals); if (!x || x.ok === false) throw new Error((x && x.error) || 'swap failed'); return x; });
+-    if (r) { out.tokenSwapped = Number(tok.raw); await attempt('close token account', () => closeTokenAccounts(tok)); }
++    if (r) { out.tokenSwapped = Number(tok.raw); if (r.sig) out.sigs.push(r.sig); await attempt('close token account', () => closeTokenAccounts(tok)); }
+     await sleep(3000);
+   }
+   const sol = await getSolBalance();
+@@ -22,7 +22,7 @@
+   out.solPile = pile;
+   if (pile > SOL_DUST) {
+     const r = await attempt('SOL pile->USDC', async () => { const x = await swapSolToUsdc(BigInt(Math.round(pile * 1e9))); if (!x || x.ok === false) throw new Error((x && x.error) || 'swap failed'); return x; });
+-    if (r) out.solSwapped = pile;
++    if (r) { out.solSwapped = pile; if (r.sig) out.sigs.push(r.sig); }
+   }
+   await sleep(2000);
+   out.usdcAfter = await getUsdcBalance();
