@@ -560,7 +560,8 @@ function startPolling() {
   polling = true;
   const loop = async () => {
     while (polling) {
-      try { await pollOnce(); } catch { await new Promise((r) => setTimeout(r, 2000)); }
+      // PATCHED: a failed/skipped poll (e.g. no token) returned instantly and spun the event loop; back off instead.
+      try { const r = await pollOnce(); if (!r || !r.ok) await new Promise((r2) => setTimeout(r2, 5000)); } catch { await new Promise((r) => setTimeout(r, 2000)); }
     }
   };
   loop().catch(() => {});
