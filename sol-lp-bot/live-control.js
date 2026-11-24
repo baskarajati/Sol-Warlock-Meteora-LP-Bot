@@ -57,8 +57,36 @@ function assertOwnPm2App(name, kind) {
   return name;
 }
 
+function isPm2NotFound(res) {
+  // spawnSync reports a missing binary via res.error, not via exit code:
+  // status is null and error.code is 'ENOENT'. That means pm2 is simply
+  // not installed / not on PATH, so no live app can be running under pm2.
+  // Any other failure (pm2 present but jlist exits non-zero, times out,
+  // or prints unparseable output) is NOT this case and stays 'unknown'
+  // (fail closed). Only ENOENT is downgraded to 'missing'.
+  const err = res && res.error;
+  return !!err && (err.code === 'ENOENT' || /ENOENT/.test(String(err.message || '')));
+}
+
 function pm2LiveStatus() {
-  const res = spawnSync(pm2Bin(), ['jlist'], { env: cleanPm2Env(), encoding: 'utf8', timeout: 15000 });
+  let res;
+  try {
+    res = spawnSync(pm2Bin(), ['jlist'], { env: cleanPm2Env(), encoding: 'utf8', timeout: 15000 });
+  } catch (e) {
+    // spawnSync normally reports a missing binary via res.error, not by
+    // throwing; handle a throw the same way for completeness.
+    if (e && (e.code === 'ENOENT' || /ENOENT/.test(String(e.message || '')))) return { running: false, status: 'missing' };
+    return { running: false, status: 'unknown' };
+  }
+  // Semantic fix (Edit-modal bug, 2026-11-18): pm2 absent is NOT unknown.
+  // Absent pm2 means live is not running via pm2, i.e. 'missing'. This is
+  // deliberately location-independent: no node-version-specific pm2 path
+  // is hardcoded, so it keeps working whatever pm2 install (or none) the
+  // host has. The old code returned 'unknown' here, which made
+  // paperAllowed false in miniapp/public/app.js renderLive() and hid the
+  // Edit-modal / Tambah-modal forms, and also made POST /api/paper/*
+  // return 409 in miniapp/server.js.
+  if (isPm2NotFound(res)) return { running: false, status: 'missing' };
   if (res.status !== 0) return { running: false, status: 'unknown' };
   let apps = [];
   try { apps = JSON.parse(res.stdout || '[]'); } catch { return { running: false, status: 'unknown' }; }
