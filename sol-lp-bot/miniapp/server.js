@@ -33,14 +33,14 @@ async function rentScan(opts, secretsDir) {
   if (!meta.hasKey || !meta.publicAddress) return { ok: false, status: 400, error: 'key not stored' };
   if (opts.rentScanFn) return { ok: true, ...(await opts.rentScanFn(meta.publicAddress)) };
   const web3 = require('@solana/web3.js');
-  const conn = new web3.Connection(opts.rpc || require('../rpc-config').url(), 'confirmed');
+  const conn = opts.rpc ? new web3.Connection(opts.rpc, 'confirmed') : require('../rpc-config').connection('confirmed');   // review fix: RPC_URL_1..3 failover
   return { ok: true, ...(await tokenRent.scan({ conn, owner: meta.publicAddress, PublicKey: web3.PublicKey, protectedMints: liveProtectedMints(opts) })) };
 }
 async function rentClaim(opts, secretsDir) {
   if (opts.rentClaimFn) return opts.rentClaimFn();
   const web3 = require('@solana/web3.js'), spl = require('@solana/spl-token');
   const keypair = walletStore.loadKeypair(secretsDir);
-  const conn = new web3.Connection(opts.rpc || require('../rpc-config').url(), 'confirmed');
+  const conn = opts.rpc ? new web3.Connection(opts.rpc, 'confirmed') : require('../rpc-config').connection('confirmed');   // review fix: RPC_URL_1..3 failover
   const prep = async tx => { tx.feePayer = keypair.publicKey; tx.recentBlockhash = (await conn.getLatestBlockhash('confirmed')).blockhash; return tx; };
   return tokenRent.claim({
     conn, keypair, web3, spl, protectedMints: liveProtectedMints(opts),
@@ -197,9 +197,12 @@ function createApp(opts = {}) {
   }
 
   function authInit(req, body, { write, maxAgeSec } = {}) {
-    if (locked()) return { ok: false, status: 403, error: 'unauthorized', reason: 'locked out' };
+    // Review fix (24 Nov 2026): the lockout counter is global, so anyone who knows the tunnel URL could send 8 bad requests and
+    // lock the owner out for 15 min (no STOP / close from the mini app during live). A request whose initData carries a valid
+    // owner HMAC (it cannot be forged without the bot token) is now checked BEFORE the lock and is never locked out.
     const v = settings.validateInitData(initDataFrom(req, body), botToken(), { maxAgeSec });
     if (!v.ok) {
+      if (locked()) return { ok: false, status: 403, error: 'unauthorized', reason: 'locked out' };
       noteFail();
       return { ok: false, status: 403, error: 'unauthorized', reason: v.reason };
     }

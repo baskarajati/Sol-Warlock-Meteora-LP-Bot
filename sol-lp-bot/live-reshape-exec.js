@@ -6,6 +6,13 @@
 const core = require('./reshape-core');
 function trigger({ pos, activeBinId, settings, stop }) {
   if (stop || settings.RESHAPE_ENABLED === false) return { due: false };
+  // Item 1 (closes OPEN-3): per-leg reshape cap RESHAPE_MAX. The pristine
+  // live trigger has no cap — only the paper variant-E freeze gate does
+  // (bot.js paperCycle). Unset setting = D-0c default 5; an explicit
+  // positive integer in settings wins. A frozen leg stays open; the -20%
+  // emergency stop, TP and max-age exits stay live.
+  const max = Number.isFinite(settings.RESHAPE_MAX) ? settings.RESHAPE_MAX : 5;
+  if ((pos.reshapes || 0) >= max) return { due: false, capped: true, max, reshapes: pos.reshapes || 0 };
   const n = settings.RESHAPE_N ?? 5, anchor = pos.lastReshapeActiveBin ?? pos.entryActiveBin, down = anchor - activeBinId;
   return { due: down >= n, down, n, anchor };
 }

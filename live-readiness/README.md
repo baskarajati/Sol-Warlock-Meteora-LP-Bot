@@ -1,5 +1,27 @@
 # System-readiness Phase 1 — review branch (v1)
 
+> **Install status — `fix/live-readiness` branch (24 Nov 2026, review fix).**
+> The Item 1 wiring is now APPLIED in the tree (`bot.js`, `live-reshape-exec.js`,
+> `paper-settings.js`). Do not apply the patches again. The creation patches for
+> `live-halt.js` and `halt-params.json` were removed: these files were already in
+> the tree, and `patch` appended a second copy (exit 0), so `live-halt.js` failed
+> with `SyntaxError: Identifier 'fs' has already been declared`. `maxFeeBps` is 0
+> for both bots (v2 fee removed). The Item 1 <-> Item 4a `bot.js` hand-merge (N3)
+> is still open: the Item 4a diffs were not applied.
+>
+> **v2 live-bugfix set ported to v1 (same branch, review fix).** v1 `bot.js` now has
+> the v2 safety code: `send()` re-broadcast + status loop (`confirmRaw`), Jupiter
+> swaps through the same loop (`sendSwapTx`, amounts sent as strings: v1 sent
+> numbers, which Jupiter answers with 422), tracked opens (`pendingOpens`),
+> resumable and ghost closes (`closePendingReason`, `closeSigs`, saved swap-back
+> result), `reconcileLive` at start and every 30 min (adopts as USDC capital),
+> pending token sells with capped slippage, atomic `state.json` + strict load, the
+> duplicate-position fix in `live-positions.js`, and `RPC_URL_1..3` failover
+> (`rpc-config.js`, also in `live-control.js` and the mini app). Modules copied
+> from v2: `live-safety.js`, `live-positions.js`, `live-open-exec.js`,
+> `live-close-exec.js`, `rpc-config.js`. Tests: `sol-lp-bot/test-live-*.js`,
+> `sol-lp-bot/test-rpc-*.js`.
+
 Snapshot of the Warlock live system-readiness **Phase 1** code (2026-11-24) for
 independent bug review by sole's Claude. Branched from `main`
 @ `22a59b432ad8aa6c5e5913f38d91e1fc76093411`. `main` is untouched; nothing here
