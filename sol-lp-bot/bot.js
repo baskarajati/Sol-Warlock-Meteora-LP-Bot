@@ -57,6 +57,7 @@ const liveHalt = require('./live-halt');   // Item 1: per-book safety-halt enfor
 const configLoader = require('./config-loader'); // system-configurable v1: strategy params live in config/warlock-config.json, loaded at start
 const h17 = require('./h17-reject');   // H17 pump-cliff reject (deep-analysis §5.7 test #1, config-gated)
 const paperHalt = require('./paper-halt');   // register #13: code-enforced halt executor for the paper books (deep-analysis §5.5)
+const chainBudget = require('./paper-chain-budget'); // X5 chain-reshape budget + X3 pool cooldown (B3 X5 port, config-driven; Delta/Golf)
 const shadowStamps = require('./shadow-stamps'); // stamps-v1: logging-only shadow stamps (best-effort, no decision-path use)
 
 const DIR = process.env.LP_BOT_DIR || '/workspace/lp-bot';
@@ -115,6 +116,25 @@ function paperHaltFor(bookId) {
   if (!h) { h = paperHalt.create({ bookId, dir: PAPER_DIR, params: WC.paperHalt, log }); paperHaltByBook.set(bookId, h); }
   return h;
 }
+
+// X5 chain-reshape budget (B3 X5 port, feature spec 27 Nov 2026): config-
+// driven, read from the resolved profile only — no budget/window literal
+// anywhere in code. CHAIN_BUDGET is null when the profile has no enabled
+// reshape.chainBudget section (Alpha/Echo/Foxtrot): every call site below
+// is guarded on it, so those profiles behave exactly as before and never
+// create a ledger file or emit an x5_* event. Per the Delta/Golf
+// pre-registrations the budget counts book E's legs only; A/D/B7 are
+// secondary arms in the same instance and run unbudgeted.
+const CHAIN_BUDGET = chainBudget.chainBudgetFromProfile(WC);
+function chainBudgetFor(variantId) { return (CHAIN_BUDGET && variantId === 'E') ? CHAIN_BUDGET : null; }
+// Persisted per-pool re-centre ledger (paper/rails-state.json), lazily
+// loaded — never touched while the feature is off — and the append-only
+// rail decision log (paper/rails-events.jsonl). Both best-effort: a
+// ledger/log failure must never break the trading loop.
+let chainLedgerCache = null;
+function chainLedger() { if (!chainLedgerCache) chainLedgerCache = chainBudget.loadLedger(PAPER_DIR); return chainLedgerCache; }
+function saveChainLedger() { if (chainLedgerCache) chainBudget.saveLedger(PAPER_DIR, chainLedgerCache); }
+function chainEvent(ev) { try { fs.mkdirSync(PAPER_DIR, { recursive: true }); fs.appendFileSync(path.join(PAPER_DIR, 'rails-events.jsonl'), JSON.stringify({ at: now(), instance: WARLOCK_CONFIG.profileName, ...ev }) + '\n'); } catch { /* best-effort */ } }
 
 const CFG = {
   // System-configurable v1: EVERY strategy number below comes from
@@ -1495,8 +1515,23 @@ async function paperOpenAll(p,state,opts={}) {
  }
  // USDC path (Window 2): one leg per openable variant book, one shared paperOpenSingle
  // call so the entry quote/plan/geometry is computed once and stamped into each book.
- const targets=VARIANTS.filter((v) => haltOpenable(v) && openable(state.books[v.id]) && multi.budget(state.books[v.id], CFG) > 1);
- if(!targets.length)return {skipped:'Saldo USDC tidak cukup'};
+ const targets0=VARIANTS.filter((v) => haltOpenable(v) && openable(state.books[v.id]) && multi.budget(state.books[v.id], CFG) > 1);
+ // X5/X3 (B3 X5 port, book E only): a pool in X3 cooldown takes no fresh
+ // entry in E. The cooldown starts on a chain_reshape_budget_exit close
+ // (read from E's close history) and escalates per B3 X3; without it a
+ // budget-exited pool would be re-entered on the next scan and the
+ // exhaustion would not bind. Other books open as before.
+ const targets=targets0.filter((v) => {
+   const cbOpen = chainBudgetFor(v.id);
+   if (!cbOpen) return true;
+   const cs = chainBudget.cooldownStatus((state.books[v.id].history || []), p.address, Date.now());
+   if (!cs.blocked) return true;
+   chainEvent({ type: 'x3_block', variant: v.id, pool: p.address, name: p.name, why: `X3 cooldown (${cs.kind}) until ${new Date(cs.until).toISOString()}`, until: cs.until, kind: cs.kind });
+   log(`OPEN rail skip [${v.id}] ${p.name}: X3 cooldown ${cs.kind} s/d ${new Date(cs.until).toISOString()}`);
+   return false;
+ });
+ if(!targets0.length)return {skipped:'Saldo USDC tidak cukup'};
+ if(!targets.length)return {skipped:'Semua buku diblokir X3 cooldown untuk entry ini'};
  const legs={},allocations={};
  for(const v of targets){const b=state.books[v.id];allocations[v.id]=multi.budget(b,CFG);legs[v.id]={...b,positions:undefined,position:null,virtual:{...b.virtual,usdc:allocations[v.id],sol:0}};}
  const result=await paperOpenSingle(p,{...state,books:legs},opts);
@@ -1898,6 +1933,30 @@ async function paperClose(book,variant,reason,snap,quoteCache={},exitVal=null,op
 
 async function paperRepositionRight(state,book,v,snap,val){
  const old=book.position,number=(old.rightRepositions||0)+1;
+ // X5 chain-reshape budget (B3 X5 port, book E only): a reposition IS an
+ // entry path and the rails bind it. X3: if this book is in cooldown for
+ // this pool, refuse — the caller converts the refusal into a final close
+ // (x3_cooldown_block). X5: a reposition is a re-centre event; at budget
+ // exhaustion the caller final-closes instead (chain_reshape_budget_exit).
+ // Refusals return a string sentinel, never throw, so the transactional
+ // close+reopen below is never half-entered.
+ const cbReposition = chainBudgetFor(v.id);
+ if (cbReposition) {
+   const cs = chainBudget.cooldownStatus(book.history || [], old.pool, Date.now());
+   if (cs.blocked) {
+     old.exitTrigger = { rule: 'x3_cooldown', kind: cs.kind, until: cs.until };
+     chainEvent({ type: 'x3_reposition_block', variant: v.id, pool: old.pool, name: old.name, until: cs.until, kind: cs.kind });
+     log(`  [${v.id}] reposition DIBLOKIR X3 ${old.name}: cooldown ${cs.kind} s/d ${new Date(cs.until).toISOString()}; leg ditutup final`);
+     return 'x3-blocked';
+   }
+   const cnt = chainBudget.chainEventsInWindow(chainLedger(), v.id, old.pool, Date.now(), cbReposition.windowMs);
+   if (cnt >= cbReposition.budget) {
+     old.exitTrigger = { rule: 'chain_reshape_budget', budget: cbReposition.budget, count24h: cnt };
+     chainEvent({ type: 'x5_reposition_block', variant: v.id, pool: old.pool, name: old.name, count24h: cnt });
+     log(`  [${v.id}] reposition DIBLOKIR X5 ${old.name}: chain budget ${cnt}/${cbReposition.budget} (24h); leg ditutup final`);
+     return 'x5-blocked';
+   }
+ }
  const work=JSON.parse(JSON.stringify(book)),workState={...state,books:{[v.id]:work}};
  const rec=await paperClose(work,v,'oor_right_reposition_leg',snap,{},val,{intermediate:true,silent:true});
  try{
@@ -1923,6 +1982,12 @@ async function paperRepositionRight(state,book,v,snap,val){
   for(const k of ['peakPnlCapital','peakPnlUsd','peakPnlPctUsdc','peakPnlAt'])if(old[k]!=null)pos[k]=old[k];
   const event={capitalAsset:old.capitalAsset||'USDC',pnlCapital:val.pnlCapital,at:now(),atWib:wib(),name:old.name,pool:old.pool,number,pnlUsd:val.pnlUsd,pnlPct:val.pnlPct,reason:`net ${val.pnlPct.toFixed(3)}% < minimum ${CFG.OOR_RIGHT_MIN_PROFIT_PCT}%`,minBinId:pos.minBinId,maxBinId:pos.maxBinId,activeBin:pos.entryActiveBin,carryPnlUsd:pos.realizedPnlCarryUsd};
   Object.assign(book,work); // commit the complete paper close+reopen, never a partial leg
+  // X5: a successful reposition is a re-centre event on the chain budget.
+  if (cbReposition && chainBudget.countsEvent(cbReposition, 'right_reposition')) {
+    chainBudget.recordChainEvent(chainLedger(), v.id, old.pool, Date.now(), cbReposition.windowMs);
+    saveChainLedger();
+    if (book.position) book.position.chainRecentres24h = chainBudget.chainEventsInWindow(chainLedger(), v.id, old.pool, Date.now(), cbReposition.windowMs);
+  }
   book.rightRepositionEvents=book.rightRepositionEvents||[];book.rightRepositionEvents.push(event);
   try{fs.appendFileSync(F('repositions.jsonl'),JSON.stringify(event)+'\n');}catch{}
   log(`REPOSITION KANAN #${number} ${old.name}: ${event.reason}; range ${pos.minBinId}..${pos.maxBinId}; carryPnL=${pos.realizedPnlCarryUsd.toFixed(4)} USDC; swaps/gas/rent included ${quotePnl.logFields(rec)}`);
@@ -2053,7 +2118,21 @@ async function paperCycle(state) {
         // emergency stop above (decide()) stays live, so a frozen position can still
         // be stopped out. Logged once per position, not every poll.
         const frozen=Number.isFinite(policy.RESHAPE_MAX)&&(pos.reshapes||0)>=policy.RESHAPE_MAX;
-        if(frozen){if(!pos.reshapeFreezeLogged){pos.reshapeFreezeLogged=true;log(`  [${v.id}] reshape FROZEN ${pos.name}: ${pos.reshapes} reshapes (RESHAPE_MAX=${policy.RESHAPE_MAX}); position stays, -20% backstop live`);}}
+        // X5 chain-reshape budget (B3 X5 port, book E only): the budget is
+        // consulted at the moment a re-centre would occur. Exhaustion EXITS
+        // (never freeze-and-hold) and the close starts the X3 cooldown for
+        // the pool via the book's history. Emergency stops decided above
+        // keep precedence: this block only runs when exitReason is unset.
+        const cbCycle = chainBudgetFor(v.id);
+        const x5Count = cbCycle ? chainBudget.chainEventsInWindow(chainLedger(), v.id, pos.pool, Date.now(), cbCycle.windowMs) : null;
+        if (x5Count != null) pos.chainRecentres24h = x5Count;
+        if (x5Count != null && x5Count >= cbCycle.budget) {
+          exitReason = 'chain_reshape_budget_exit';
+          pos.exitTrigger = { rule: 'chain_reshape_budget', budget: cbCycle.budget, count24h: x5Count };
+          chainEvent({ type: 'x5_exhaustion', variant: v.id, pool: pos.pool, name: pos.name, count24h: x5Count, action: 'exit + X3 cooldown' });
+          log(`  [${v.id}] X5 chain budget HABIS ${pos.name}: ${x5Count}/${cbCycle.budget} re-centre (24h) — exit + cooldown`);
+        }
+        else if(frozen){if(!pos.reshapeFreezeLogged){pos.reshapeFreezeLogged=true;log(`  [${v.id}] reshape FROZEN ${pos.name}: ${pos.reshapes} reshapes (RESHAPE_MAX=${policy.RESHAPE_MAX}); position stays, -20% backstop live`);}}
         else{
         const anchor=pos.lastReshapeActiveBin??pos.entryActiveBin,down=anchor-snap.active.binId;
         if(down>=pv.n){
@@ -2061,6 +2140,12 @@ async function paperCycle(state) {
             const ev=await paperReshape(pos,snap,book,pv,sdkCache,{compound:pv.compound});
             if(ev?.skipped)log(`  [${v.id}] reshape skipped: ${ev.skipped} (downBins=${down}, N=${v.n})`);
             if(ev&&!ev.skipped){
+              // X5: a completed reshape is a re-centre event on the chain budget.
+              if (cbCycle && chainBudget.countsEvent(cbCycle, 'reshape')) {
+                chainBudget.recordChainEvent(chainLedger(), v.id, pos.pool, Date.now(), cbCycle.windowMs);
+                saveChainLedger();
+                pos.chainRecentres24h = (x5Count || 0) + 1;
+              }
               snap={...snap,value:markValue(pos.bins,snap.price,pos.feeX||0,pos.feeY||0),inv:markValue(pos.bins,snap.price,0,0)};
               val=await paperUsdc.exitQuote({pos,book,snap,quote:jupiterQuote,txFee:CFG.TX_FEE_SOL});
               exitReason=paperExit.decide({pos,val,activeBin:snap.active.binId,settings:policy,pollId});
@@ -2086,7 +2171,10 @@ async function paperCycle(state) {
       log(`monitor [${v.id}] ${pos.name}: value=${live.valueQuote.toFixed(6)} ${live.quoteSymbol} pnlUsdc=${val.pnlUsd.toFixed(4)} pnlUsdcPct=${val.pnlPct.toFixed(4)}% exitUsdc=${val.usdcOut.toFixed(4)} peakUsd=${Number(pos.peakPnlUsd??0).toFixed(4)} quoted=${val.quoted} feesUsd=${live.feesUsd.toFixed(4)} age=${ageH.toFixed(2)}h inRange=${snap.inRange} shape=${pos.shape} active=${snap.active.binId} range=${pos.minBinId}..${pos.maxBinId} ${quotePnl.logFields(live)}`);
       if(exitReason==='oor_right_reposition'){
         const repositioned=await paperRepositionRight({...state,books:{[v.id]:book}},book,v,snap,val);
-        if(repositioned&&book.position)book.position.lastLive=null;
+        // X5/X3 rail refusals convert the reposition into a final close (B3 port).
+        if(repositioned==='x3-blocked'){await paperClose(book,v,'x3_cooldown_block',snap,quoteCache,val);}
+        else if(repositioned==='x5-blocked'){await paperClose(book,v,'chain_reshape_budget_exit',snap,quoteCache,val);}
+        else if(repositioned&&book.position)book.position.lastLive=null;
       }else if(exitReason){
         if(!val.quoted)log(`exit fallback ${pos.name}: ${val.quoteErrors.join('; ')}; conservative paper valuation, not a Jupiter-verified TP`);
         await paperClose(book,v,exitReason,snap,quoteCache,val);

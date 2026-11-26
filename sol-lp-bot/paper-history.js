@@ -33,6 +33,8 @@ function closeReason(h){
  if(r.startsWith('emergency_slplus '))return 'TP Emergency SL+ (kunci profit setelah TP emergency aktif) '+r.slice(17).replace(/ \(recalc\)$/,'');
  if(r.startsWith('emergency_tp '))return 'TP emergency (harga sempat turun dalam dari entry) '+r.slice(13);
  if(r==='oor_left_timeout')return 'OOR kiri melewati batas waktu';
+ if(r==='chain_reshape_budget_exit')return 'X5: chain reshape budget habis (exit + X3 cooldown)';
+ if(r==='x3_cooldown_block')return 'X3: reposition ditolak, pool dalam cooldown';
  if(r==='paper STOP')return 'Paper dihentikan (STOP)';
  if(r==='paper 7d window ended')return 'Periode paper berakhir';
  return 'tidak diketahui';

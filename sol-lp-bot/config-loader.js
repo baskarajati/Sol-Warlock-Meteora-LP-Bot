@@ -127,7 +127,9 @@ const SCHEMA = {
   'paperHalt.enabled': ['bool'],
   'reshape.compoundEnabled': ['bool'],
   'reshape.reshapeEnabled': ['bool'],
-  'reshape.reshapeMax': ['count'],
+  // reshapeMax null = per-leg reshape uncapped (Delta: the chain budget is
+  // the only reshape discipline). A finite value is the per-leg freeze cap.
+  'reshape.reshapeMax': [{ kind: 'countOrNull' }],
   'reshape.reshapeN': ['count'],
   'screening.ageGateEnabled': ['bool'],
   'screening.feeTvlGate20Enabled': ['bool'],
@@ -160,6 +162,23 @@ const SCHEMA = {
 function getPath(obj, dotted) {
   return dotted.split('.').reduce((o, k) => (o && typeof o === 'object' ? o[k] : undefined), obj);
 }
+
+// X5 chain-reshape budget (B3 X5 port, feature spec §4): OPTIONAL section.
+// A profile without reshape.chainBudget behaves exactly as before (feature
+// off). When the section IS present, every key below is required and
+// validated — a half-written budget section fails fast instead of running
+// on a guessed budget. Only the specified values are accepted:
+// scope 'book', count drawn from ['reshape', 'right_reposition'],
+// onExhaust 'exit', cooldown 'x3'.
+const CHAIN_BUDGET_SCHEMA = {
+  'reshape.chainBudget.enabled': ['bool'],
+  'reshape.chainBudget.budget': ['count'],
+  'reshape.chainBudget.windowHours': ['pos'],
+  'reshape.chainBudget.scope': [{ kind: 'enum', options: ['book'] }],
+  'reshape.chainBudget.count': [{ kind: 'chainBudgetCount' }],
+  'reshape.chainBudget.onExhaust': [{ kind: 'enum', options: ['exit'] }],
+  'reshape.chainBudget.cooldown': [{ kind: 'enum', options: ['x3'] }],
+};
 function setPath(obj, dotted, value) {
   const parts = dotted.split('.');
   let o = obj;
@@ -185,6 +204,18 @@ function checkValue(dotted, spec, value, problems) {
   }
   if (kind && kind.kind === 'enum') {
     if (!kind.options.includes(value)) problems.push(`${dotted}=${JSON.stringify(value)} must be one of ${kind.options.join(', ')}`);
+    return;
+  }
+  if (kind && kind.kind === 'countOrNull') {
+    // null = uncapped (Delta per-leg freeze off); otherwise an integer >= 1.
+    if (value === null) return;
+    if (typeof value !== 'number' || !Number.isInteger(value) || value < 1) problems.push(`${dotted}=${JSON.stringify(value)} must be an integer >= 1 or null (unlimited)`);
+    return;
+  }
+  if (kind && kind.kind === 'chainBudgetCount') {
+    if (!Array.isArray(value) || !value.length || !value.every((v) => v === 'reshape' || v === 'right_reposition')) {
+      problems.push(`${dotted}=${JSON.stringify(value)} must be a non-empty array drawn from ['reshape', 'right_reposition']`);
+    }
     return;
   }
   if (typeof value !== 'number' || !Number.isFinite(value)) {
@@ -244,9 +275,18 @@ function validateProfile(profile, name) {
     if (v === undefined) { problems.push(`${dotted} is missing`); continue; }
     checkValue(dotted, spec, v, problems);
   }
+  // Optional X5 chain-budget section: absent = feature off (no ledger, no
+  // x5_* events, no behaviour change). Present = every key required.
+  if (getPath(profile, 'reshape.chainBudget') !== undefined) {
+    for (const [dotted, spec] of Object.entries(CHAIN_BUDGET_SCHEMA)) {
+      const v = getPath(profile, dotted);
+      if (v === undefined) { problems.push(`${dotted} is missing (reshape.chainBudget is present, so every chain-budget key is required)`); continue; }
+      checkValue(dotted, spec, v, problems);
+    }
+  }
   // Unknown keys are a fail, not a warning: a typo'd key would silently do nothing.
   // Documentation-only keys are allowlisted (they never reach the bot).
-  const known = new Set(Object.keys(SCHEMA));
+  const known = new Set([...Object.keys(SCHEMA), ...Object.keys(CHAIN_BUDGET_SCHEMA)]);
   const ignored = new Set(['description', 'entrySync.note']);
   const walk = (obj, prefix) => {
     for (const k of Object.keys(obj || {})) {
@@ -312,4 +352,4 @@ function loadConfig({ configPath = DEFAULT_CONFIG_PATH, profile: profileName, ov
   return { profileName: name, configPath, profile, derived };
 }
 
-module.exports = { loadConfig, validateProfile, resolveProfile, SCHEMA, DEFAULT_CONFIG_PATH, getPath, setPath };
+module.exports = { loadConfig, validateProfile, resolveProfile, SCHEMA, CHAIN_BUDGET_SCHEMA, DEFAULT_CONFIG_PATH, getPath, setPath };
