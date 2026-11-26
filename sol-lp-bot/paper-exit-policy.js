@@ -1,5 +1,24 @@
 "use strict";
+const stopEnforcement = require('./stop-enforcement');
+// System-configurable v1: fallback defaults for settings keys come from
+// the active warlock-config profile (exits section) when it loads; the
+// literals after the comma are the last-resort fallback for a standalone
+// caller without the config file. In production every key is always
+// supplied (bot.js CFG + strategy.snapshot), so these fallbacks never
+// fire there — they exist so a partial settings object cannot silently
+// arm a different exit rule.
+let EXIT_DEFAULTS = null;
+try { EXIT_DEFAULTS = require('./config-loader').loadConfig().profile.exits; } catch { /* keep literal fallbacks */ }
+const D = (key, fallback) => (EXIT_DEFAULTS && EXIT_DEFAULTS[key] !== undefined ? EXIT_DEFAULTS[key] : fallback);
 // Percent settings are percentage points; EMERGENCY_DROP remains a fraction.
+// Stop enforcement (system-configurable v1, deep-analysis §5.3): the -20%
+// emergency stop is poll-sampled and gap-able — one Batch 1 leg went
+// -0.89% -> -27.86% inside a single 39-second poll interval. Every
+// valuation now updates pos.worstPnlPct (lowest net PnL% seen since
+// entry), and decide() fires 'emergency_stop' when the WORST breaches,
+// even if the current poll's PnL has recovered above -20%. A dip below
+// the stop that recovers before the next poll used to survive; it no
+// longer does. See stop-enforcement.js.
 function updatePeak(pos,val,now=Date.now()){
  if(!val.quoted)return;
  if(pos.capitalAsset==='SOL'?(!Number.isFinite(pos.peakPnlCapital)||val.pnlCapital>pos.peakPnlCapital):(!Number.isFinite(pos.peakPnlUsd)||val.pnlUsd>pos.peakPnlUsd)){pos.peakPnlCapital=val.pnlCapital;pos.peakPnlUsd=val.pnlUsd;pos.peakPnlPctUsdc=val.pnlPct;pos.peakPnlAt=new Date(now).toISOString();}
@@ -23,7 +42,7 @@ function openRangeDownPct(pos){
  if(r>0)pos.openRangeDownPct=r;
  return r>0?r:null;
 }
-function triggerDropPct(pos,settings){const r=openRangeDownPct(pos),f=Number(settings.EMERGENCY_TP_TRIGGER_RANGE_PCT??50);return r&&Number.isFinite(f)?r*f/100:null;}
+function triggerDropPct(pos,settings){const r=openRangeDownPct(pos),f=Number(settings.EMERGENCY_TP_TRIGGER_RANGE_PCT ?? D('emergencyTpTriggerRangePct', 50));return r&&Number.isFinite(f)?r*f/100:null;}
 function updatePriceDrop(pos,activeBin,settings={},now=Date.now()){
  const d=priceDropPct(pos,activeBin);if(d==null)return;
  if(!Number.isFinite(pos.maxPriceDropPct)||d>pos.maxPriceDropPct){pos.maxPriceDropPct=d;pos.maxPriceDropAt=new Date(now).toISOString();pos.maxPriceDropBin=activeBin;}
@@ -31,9 +50,9 @@ function updatePriceDrop(pos,activeBin,settings={},now=Date.now()){
  if(!pos.deepDrawdown&&trig!=null&&pos.maxPriceDropPct>=trig){pos.deepDrawdown=true;pos.deepDrawdownAt=new Date(now).toISOString();pos.deepDrawdownBin=activeBin;pos.deepDrawdownDropPct=pos.maxPriceDropPct;pos.deepDrawdownTriggerPct=trig;}
 }
 function effectiveTp(pos,settings){
- const tp=Number(settings.TP_USD_PCT??(settings.TP!=null?Number(settings.TP)*100:20));
+ const tp=Number(settings.TP_USD_PCT ?? (settings.TP != null ? Number(settings.TP) * 100 : D('tpUsdPct', 13)));
  const trig=triggerDropPct(pos,settings),deep=!!pos.deepDrawdown||(trig!=null&&Number.isFinite(pos.maxPriceDropPct)&&pos.maxPriceDropPct>=trig);
- if(settings.EMERGENCY_TP_ENABLED===true&&deep)return {pct:Number(settings.EMERGENCY_TP_PCT??10),emergency:true};
+ if(settings.EMERGENCY_TP_ENABLED===true&&deep)return {pct:Number(settings.EMERGENCY_TP_PCT ?? D('emergencyTpPct', 10)),emergency:true};
  return {pct:tp,emergency:false};
 }
 // TP Emergency SL+ (Tuan, 12 Nov 2026). After TP Emergency v1 is armed (pos.deepDrawdown) and net PnL touches
@@ -41,11 +60,11 @@ function effectiveTp(pos,settings){
 // EMERGENCY_SLPLUS_CONFIRM_POLLS consecutive polls it is closed (profit protection). Same PnL basis as SL (-20%): estimates allowed,
 // no verified quote required (a protective exit must not wait for a quote). Once armed it stays armed until the position closes.
 function slPlusCfg(settings){
- const arm=Number(settings.EMERGENCY_SLPLUS_ARM_PCT??3),lock=Number(settings.EMERGENCY_SLPLUS_LOCK_PCT??0.1),n=Math.floor(Number(settings.EMERGENCY_SLPLUS_CONFIRM_POLLS??3));
+ const arm=Number(settings.EMERGENCY_SLPLUS_ARM_PCT ?? D('slPlusArmPct', 3)),lock=Number(settings.EMERGENCY_SLPLUS_LOCK_PCT ?? D('slPlusLockPct', 0.1)),n=Math.floor(Number(settings.EMERGENCY_SLPLUS_CONFIRM_POLLS ?? D('slPlusConfirmPolls', 3)));
  const on=settings.EMERGENCY_SLPLUS_ENABLED===true&&Number.isFinite(arm)&&Number.isFinite(lock)&&lock<arm&&n>=1;
  // BEP floor (second protection, 12 Nov 2026): once armed, PnL <= FLOOR (default 0 = BEP) for FLOOR_POLLS polls (default 1 = immediately) closes at once,
  // without waiting for the CONFIRM polls of the lock, so a fast fall after the peak cannot reach SL -20%. Only active when the key is present and FLOOR < LOCK.
- const fl=settings.EMERGENCY_SLPLUS_FLOOR_PCT,floor=fl===undefined||fl===null?NaN:Number(fl),fn=Math.max(1,Math.floor(Number(settings.EMERGENCY_SLPLUS_FLOOR_POLLS??2)));
+ const fl=settings.EMERGENCY_SLPLUS_FLOOR_PCT,floor=fl===undefined||fl===null?NaN:Number(fl),fn=Math.max(1,Math.floor(Number(settings.EMERGENCY_SLPLUS_FLOOR_POLLS ?? D('slPlusFloorPolls', 2))));
  return {on,arm,lock,n:Math.max(1,n),floorOn:on&&Number.isFinite(floor)&&floor<lock,floor,fn:Number.isFinite(fn)?fn:1};
 }
 function slPlusTrack(pos,val,settings,advance,now=Date.now()){
@@ -66,7 +85,7 @@ function slPlusTrack(pos,val,settings,advance,now=Date.now()){
 function staleCheck(pos,val,settings,now=Date.now()){
  const maxH=Number(settings.MAX_HOURS),ageH=(now-Date.parse(pos.openedAt))/3600000;
  if(settings.STALE_CLOSE_ENABLED===false||!Number.isFinite(maxH)||!(ageH>=maxH))return {close:false,aged:ageH>=maxH,ageH};
- const mode=String(settings.STALE_EXIT_MODE||'ANY').toUpperCase(),x=Number(settings.STALE_EXIT_PCT??0),pnl=Number(val?.pnlPct),base='max age '+maxH+'h';
+ const mode=String(settings.STALE_EXIT_MODE||'ANY').toUpperCase(),x=Number(settings.STALE_EXIT_PCT ?? D('staleExitPct', 5)),pnl=Number(val?.pnlPct),base='max age '+maxH+'h';
  if(mode==='ANY')return {close:true,aged:true,ageH,reason:base};
  if(!Number.isFinite(pnl))return {close:false,aged:true,ageH};
  const need=mode==='MINUS'?-Math.abs(x):mode==='BEP'?0:mode==='PROFIT'?Math.abs(x):null;
@@ -76,9 +95,10 @@ function staleCheck(pos,val,settings,now=Date.now()){
 }
 function decide({pos,val,activeBin,settings,now=Date.now(),pollId=null,stopReason=null}){
  updatePeak(pos,val,now);updatePriceDrop(pos,activeBin,settings,now);
+ stopEnforcement.updateWorstPnl(pos,val.pnlPct,now);
  const right=activeBin>pos.maxBinId,left=activeBin<pos.minBinId;
  const etp=effectiveTp(pos,settings),tpPct=etp.pct,tpReady=Number.isFinite(val.pnlPct)&&Number.isFinite(tpPct)&&val.pnlPct>=tpPct;
- const maxFailures=Number(settings.QUOTE_FAILURE_POLLS??10);
+ const maxFailures=Number(settings.QUOTE_FAILURE_POLLS ?? D('quoteFailurePolls', 10));
  if(left){if(!pos.oorLeftSince)pos.oorLeftSince=new Date(now).toISOString();}else pos.oorLeftSince=null;
  const advance=pollId===null||pos.lastExitDecisionPollId!==pollId;
  const sp=slPlusTrack(pos,val,settings,advance,now);
@@ -89,20 +109,23 @@ function decide({pos,val,activeBin,settings,now=Date.now(),pollId=null,stopReaso
  }else if(val.quoted)pos.quoteUnavailablePolls=0;
  if(stopReason)return stopReason;
  // PAPER emergency is net position equity vs original entry USDC, including fees/costs/carry.
- if(Number.isFinite(val.pnlPct)&&val.pnlPct<=-100*(settings.EMERGENCY_DROP??.20))return 'emergency_stop';
+ // Breach is judged on the WORST PnL seen since entry (stop-enforcement.js),
+ // not only on this poll's PnL: a fast move that gaps past -20% between
+ // polls, or dips below it and recovers before the poll, still stops.
+ if(stopEnforcement.isStopBreach({pnlPct:val.pnlPct,worstPnlPct:pos.worstPnlPct,emergencyDrop:settings.EMERGENCY_DROP ?? D('emergencyDrop', 0.20)}).breach)return 'emergency_stop';
  // TP Emergency SL+: armed (TP emergency v1 active + PnL touched ARM%) and PnL stayed <= LOCK% for CONFIRM polls -> close with profit protection (not a stop loss).
  if(sp.floorOn&&pos.slPlusArmed&&(pos.slPlusFloorPolls||0)>=sp.fn&&Number.isFinite(val.pnlPct)&&val.pnlPct<=sp.floor)return 'emergency_slplus '+(pos.capitalAsset||'USDC')+' '+(sp.floor===0?'BEP':'+'+sp.floor+'%')+' (peak +'+Number(pos.slPlusPeakPct).toFixed(1)+'%)';
  if(sp.on&&pos.slPlusArmed&&(pos.slPlusLowPolls||0)>=sp.n&&Number.isFinite(val.pnlPct)&&val.pnlPct<=sp.lock)return 'emergency_slplus '+(pos.capitalAsset||'USDC')+' +'+sp.lock+'% (peak +'+Number(pos.slPlusPeakPct).toFixed(1)+'%)';
  {const st=staleCheck(pos,val,settings,now);if(st.close)return st.reason;}
- if(settings.OOR_RIGHT_CLOSE!==false&&right&&pos.oorRightPolls>=(settings.OOR_RIGHT_CONFIRM_POLLS??2)){
+ if(settings.OOR_RIGHT_CLOSE!==false&&right&&pos.oorRightPolls>=(settings.OOR_RIGHT_CONFIRM_POLLS ?? D('oorRightConfirmPolls', 2))){
   if(!Number.isFinite(val.pnlPct))return null;
   if(!val.quoted&&(pos.quoteUnavailablePolls||0)<maxFailures)return null;
   // Price only just above the top of the range and net below the take-profit level: wait (it may fall back in range and keep earning) instead of burning a reposition / the limit on noise.
-  if(val.pnlPct<(settings.OOR_RIGHT_MIN_PROFIT_PCT??.5)&&(activeBin-pos.maxBinId)<(settings.OOR_RIGHT_MIN_BINS??0))return null;
-  if((pos.rightRepositions||0)>=(settings.OOR_RIGHT_MAX_REPOSITIONS??2))return 'oor_right_reposition_limit';
-  if(val.pnlPct>=(settings.OOR_RIGHT_MIN_PROFIT_PCT??.5))return val.quoted?'oor_right_take_profit':'oor_right_take_profit_fallback';
+  if(val.pnlPct<(settings.OOR_RIGHT_MIN_PROFIT_PCT ?? D('oorRightMinProfitPct', 0.5))&&(activeBin-pos.maxBinId)<(settings.OOR_RIGHT_MIN_BINS ?? D('oorRightMinBins', 5)))return null;
+  if((pos.rightRepositions||0)>=(settings.OOR_RIGHT_MAX_REPOSITIONS ?? D('oorRightMaxRepositions', 2)))return 'oor_right_reposition_limit';
+  if(val.pnlPct>=(settings.OOR_RIGHT_MIN_PROFIT_PCT ?? D('oorRightMinProfitPct', 0.5)))return val.quoted?'oor_right_take_profit':'oor_right_take_profit_fallback';
   // Too deep in the red (history: the only two repositions below -3% were Huang's, net -12% / -11%): do not churn the inventory through swaps, hold. Take-profit and the reposition LIMIT above are unaffected; SL / SL+ / stale still apply.
-  if(val.pnlPct<(settings.OOR_RIGHT_REPOSITION_MIN_PNL_PCT??-100))return null;
+  if(val.pnlPct<(settings.OOR_RIGHT_REPOSITION_MIN_PNL_PCT ?? D('oorRightRepositionMinPnlPct', -3)))return null;
   return 'oor_right_reposition'; // failed reopen is transactional and retried, never a forced close
  }
  if(tpReady&&etp.emergency&&(val.quoted||(pos.quoteUnavailablePolls||0)>=maxFailures))return 'emergency_tp '+(pos.capitalAsset||'USDC')+' +'+tpPct+'%'+(val.quoted?'':' (on-chain fallback)');
@@ -111,4 +134,4 @@ function decide({pos,val,activeBin,settings,now=Date.now(),pollId=null,stopReaso
  if(left&&settings.OOR_MAX_MIN>0&&val.quoted&&(pos.capitalAsset==='SOL'?val.pnlCapital:val.pnlUsd)<0&&(now-Date.parse(pos.oorLeftSince))/60000>=settings.OOR_MAX_MIN)return 'oor_left_timeout';
  return null;
 }
-module.exports={slPlusCfg,slPlusTrack,staleCheck,updatePeak,priceDropPct,openRangeDownPct,triggerDropPct,updatePriceDrop,effectiveTp,decide};
+module.exports={slPlusCfg,slPlusTrack,staleCheck,updatePeak,priceDropPct,openRangeDownPct,triggerDropPct,updatePriceDrop,effectiveTp,decide,updateWorstPnl:stopEnforcement.updateWorstPnl,isStopBreach:stopEnforcement.isStopBreach,checkStopNow:stopEnforcement.checkStopNow};

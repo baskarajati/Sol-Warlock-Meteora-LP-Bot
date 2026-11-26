@@ -28,6 +28,38 @@
 //    ±70-bin SOL-side split is NOT derivable without new per-pool DLMM bin
 //    fetches (out of scope). We stamp a reserve-share proxy instead and mark
 //    skewBinSplit blocked, in every row, so nobody mistakes it for the split.
+//
+// System-configurable v1 (deep-analysis §5.6, items 1–12) adds the
+// missing-data fields below. Same hard rules as stamps-v1: additive
+// fields only, no existing field changes meaning (SCHEMA stays
+// 'stamps-v1'), missing source fields are stamped null — never
+// fabricated — and each untestable-on-this-source field carries a
+// *Status field saying so, so an analyst never mistakes null for zero:
+//  - #1  pump1h (already stamped from picks), pump5m, buyRatio on scan rows
+//  - #2  TF5 volume (vol5mUsd) + trade counts; unique-trade count is NOT
+//        in the datapi record -> uniqueTrades null + uniqueTradesStatus
+//  - #3  smartWallet flag -> null + smartWalletStatus (no source field
+//        exists anywhere in the record or the RugCheck report; H12 stays
+//        untestable until a source exists)
+//  - #4  trailing-24h fee/TVL (feeTvl24h from fee_tvl_ratio['24h'])
+//  - #5  ftBand (band of ft30m at the event) so per-band first-reject
+//        extraction can be built without re-deriving the band; the
+//        first-reject dedupe itself stays in the extraction
+//  - #6  binsBelow / totalBins on poll rows (from the open position when
+//        the caller passes it; null on scan rows — no position exists)
+//  - #7  pump5m, buyRatio, healthScore (see #1; healthScore has no source)
+//  - #8  worstDrawdownPct per leg: poll rows carry the position's
+//        worstPnlPct so far; the closed-leg value is stamped by
+//        paper-history.csv() from the close record
+//  - #9  holders / organic % (holdersPct from the record when present;
+//        organicPct has no source -> null + status)
+//  - #10 comparison band flag (isComparisonBand: ft30m 0.60–0.80%,
+//        TVL >= $10k — the H4 comparison band)
+//  - #11 per-book open-attempt labelling: kind:'open-attempt' rows
+//        (stampOpenAttempt), one per book per open attempt
+//  - #12 entry synchronisation: syncGroup stamped on open-attempt rows
+//        (null until synchronised entry is implemented — see config)
+//  - #13 19–22 Nov reject universe: UNRECOVERABLE, no field can supply it.
 
 const fs = require('fs');
 const path = require('path');
@@ -61,6 +93,10 @@ function derive(p) {
     vol30mUsd: null, vol1hUsd: null, volAccel30m: null,
     marketCapUsd: null, tvlMcapRatio: null,
     skewSolPct: null, skewQuotePct: null,
+    // §5.6 additions (null = no source field; never fabricated).
+    vol5mUsd: null, feeTvl24h: null,
+    tradeCount5m: null, tradeCount1h: null, tradeCount24h: null,
+    holdersPct: null, buyRatio: null,
   };
   try {
     if (!p || typeof p !== 'object') return out;
@@ -89,6 +125,26 @@ function derive(p) {
       out.skewQuotePct = sharePct;
       if (p.token_y?.address === SOL_MINT) out.skewSolPct = sharePct;
     }
+    // §5.6 #2 (TF5 volume + trade counts) and #4 (trailing-24h fee/TVL).
+    // Candidate keys are read when the record carries them; anything else
+    // stays null — the datapi record shape is not assumed.
+    out.vol5mUsd = num(p.volume?.['5m']);
+    out.feeTvl24h = num(p.fee_tvl_ratio?.['24h']);
+    const trades = p.trades || p.trade_count || p.tradeCount || null;
+    if (trades && typeof trades === 'object') {
+      out.tradeCount5m = num(trades['5m']);
+      out.tradeCount1h = num(trades['1h']);
+      out.tradeCount24h = num(trades['24h']);
+    } else if (trades != null) {
+      out.tradeCount24h = num(trades);
+    }
+    // §5.6 #9 holders (top-10 share when the record carries it) and
+    // #1/#7 buy ratio (buys/(buys+sells) when the record carries it).
+    out.holdersPct = num(p.top10_hold_pct ?? p.holders_pct ?? p.token_x?.top10_hold_pct);
+    const buys = num(p.buys?.['1h'] ?? p.buy_count_1h);
+    const sells = num(p.sells?.['1h'] ?? p.sell_count_1h);
+    if (buys != null && sells != null && buys + sells > 0) out.buyRatio = buys / (buys + sells);
+    else out.buyRatio = num(p.buy_ratio ?? p.buyRatio);
   } catch { /* missing/odd fields -> nulls, never a throw */ }
   return out;
 }
@@ -123,7 +179,45 @@ function baseRow(p) {
     skewBasis: 'reserve_share_proxy',
     skewBinSplit: null,
     skewBinSplitStatus: BIN_SPLIT_STATUS,
+    // §5.6 #2 TF5 volume + trade counts (#2: unique-trade count has no
+    // source in the datapi record — see uniqueTradesStatus).
+    vol5mUsd: d.vol5mUsd,
+    tradeCount5m: d.tradeCount5m,
+    tradeCount1h: d.tradeCount1h,
+    tradeCount24h: d.tradeCount24h,
+    uniqueTrades: null,
+    uniqueTradesStatus: 'not_exposed_by_datapi: no unique-trade count in the datapi record (spike rule as stated stays untestable)',
+    // §5.6 #3 smart-wallet flag (H12): no source field exists anywhere.
+    smartWallet: null,
+    smartWalletStatus: 'not_exposed_by_datapi: no smart-wallet field in the datapi record or the RugCheck report (H12 untestable until a source exists)',
+    // §5.6 #4 trailing-24h fee/TVL series (feeTvl24h; feeTvl4h above is the 4h point).
+    feeTvl24h: d.feeTvl24h,
+    feeTvlTrailing24h: d.feeTvl24h,
+    // §5.6 #7 5m change / buy ratio / health score (pump5m comes from the
+    // pick in buildScanRow; healthScore has no source).
+    buyRatio: d.buyRatio,
+    healthScore: null,
+    healthScoreStatus: 'not_exposed_by_datapi: no health score in the datapi record (areio as specified stays untestable)',
+    // §5.6 #9 holders / organic % (organic has no source).
+    holdersPct: d.holdersPct,
+    organicPct: null,
+    organicPctStatus: 'not_exposed_by_datapi: no organic-holder share in the datapi record',
+    // §5.6 #6 binsBelow vs total width (scan rows have no position; poll
+    // rows fill these from ctx.position when the caller passes it).
+    binsBelow: null,
+    totalBins: null,
   };
+}
+
+// FT band of an ft30m value, for §5.6 #5 per-band first-reject extraction
+// and #10 (the H4 comparison band is 0.60–0.80% at TVL >= $10k).
+function ftBandOf(ft30m) {
+  if (!Number.isFinite(ft30m)) return null;
+  if (ft30m < 0.30) return '<0.30%';
+  if (ft30m < 0.45) return '0.30-0.45%';
+  if (ft30m < 0.60) return '0.45-0.60%';
+  if (ft30m < 0.80) return '0.60-0.80%';
+  return '>=0.80%';
 }
 
 // Build one kind:'scan' row. Exported for unit tests; stampScan uses it too.
@@ -143,9 +237,12 @@ function buildScanRow(p, ctx) {
     ft30m: null,
     ftWindow: null,
     ftWindowName: ctx.ftWindow ?? null,
+    ftBand: null,
+    isComparisonBand: null,
     ageH: null,
     binStep: num(p?.pool_config?.bin_step),
     pump1h: null,
+    pump5m: null,
     pump24h: null,
     vol1h: num(p?.volume?.['1h']),
     vol24h: num(p?.volume?.['24h']),
@@ -155,6 +252,9 @@ function buildScanRow(p, ctx) {
       row.ft30m = num(ctx.feeTvlFn(p, '30m'));
       row.ftWindow = num(ctx.feeTvlFn(p, ctx.ftWindow));
     }
+    // §5.6 #5/#10: band of ft30m at the event + the H4 comparison band.
+    row.ftBand = ftBandOf(row.ft30m);
+    row.isComparisonBand = row.ft30m != null && row.ft30m >= 0.60 && row.ft30m < 0.80 && num(p?.tvl) != null && num(p.tvl) >= 10000;
     if (Number.isFinite(+ctx.nowS) && p?.created_at != null) {
       row.ageH = (+ctx.nowS - createdAtSec(p)) / 3600;
     }
@@ -164,6 +264,8 @@ function buildScanRow(p, ctx) {
       // same units the scan log and screening UI print.
       row.pump1h = num(pick.pump1h) != null ? (+pick.pump1h) * 100 : null;
       row.pump24h = num(pick.pump24h) != null ? (+pick.pump24h) * 100 : null;
+      // §5.6 #1/#7: 5m change when the pick carries it (null otherwise).
+      row.pump5m = num(pick.pump5m) != null ? (+pick.pump5m) * 100 : null;
     }
     const reasons = ctx.reasonsByAddress?.get(p?.address) || [];
     if (ctx.pickByAddress?.has(p?.address)) {
@@ -181,8 +283,10 @@ function buildScanRow(p, ctx) {
 }
 
 // Build one kind:'poll' row from an already-fetched pool record (S-3 per-poll).
+// ctx.position (optional, the open position) supplies §5.6 #6 binsBelow /
+// totalBins and #8 worstDrawdownPct (worst net PnL% so far this leg).
 function buildPollRow(p, ctx) {
-  return {
+  const row = {
     kind: 'poll',
     schema: SCHEMA,
     at: ctx?.at ?? null,
@@ -190,6 +294,38 @@ function buildPollRow(p, ctx) {
     scanStartedAt: null,
     ...baseRow(p),
     ft30m: (ctx && typeof ctx.feeTvlFn === 'function') ? num(ctx.feeTvlFn(p, '30m')) : num(p?.fee_tvl_ratio?.['30m']),
+  };
+  try {
+    const pos = ctx?.position;
+    if (pos && typeof pos === 'object') {
+      row.binsBelow = num(pos.binsBelow ?? (Number.isFinite(pos.entryActiveBin) && Number.isFinite(pos.minBinId) ? pos.entryActiveBin - pos.minBinId + 1 : null));
+      row.totalBins = num(pos.nBins ?? pos.totalBins ?? (Number.isFinite(pos.maxBinId) && Number.isFinite(pos.minBinId) ? pos.maxBinId - pos.minBinId + 1 : null));
+      row.worstDrawdownPct = num(pos.worstPnlPct);
+    } else {
+      row.worstDrawdownPct = null;
+    }
+  } catch { row.worstDrawdownPct = null; }
+  return row;
+}
+
+// Build one kind:'open-attempt' row (§5.6 #11 per-book open-attempt
+// labelling, #12 entry synchronisation). One row per book per open
+// attempt: {pool, bookId, result:'opened'|'skipped', skipReason,
+// syncGroup}. syncGroup is null until synchronised entry is implemented
+// (config entrySync.enabled=false); the field exists so the next batch
+// can stamp the group id without a schema change.
+function buildOpenAttemptRow({ pool, bookId, result, skipReason = null, syncGroup = null, at = null, instance = null } = {}) {
+  return {
+    kind: 'open-attempt',
+    schema: SCHEMA,
+    at,
+    instance: instance ?? null,
+    pool: pool?.address ?? pool ?? null,
+    name: pool?.name ?? null,
+    bookId: bookId ?? null,
+    result: result === 'opened' ? 'opened' : 'skipped',
+    skipReason: skipReason != null ? String(skipReason) : null,
+    syncGroup: syncGroup ?? null,
   };
 }
 
@@ -213,9 +349,10 @@ function stampScan(ctx) {
   } catch { /* best-effort, exactly like railsEvent */ }
 }
 
-// stampPoll(ctx): ctx = { paperDir, at, instance, record, feeTvlFn }
+// stampPoll(ctx): ctx = { paperDir, at, instance, record, feeTvlFn, position }
 // `record` MUST be a pool record the caller already fetched for position
 // management — this function never fetches anything. Null record = no-op.
+// `position` (optional) supplies §5.6 #6/#8 fields on the poll row.
 function stampPoll(ctx) {
   try {
     if (!enabled() || !ctx || !ctx.record) return;
@@ -223,4 +360,13 @@ function stampPoll(ctx) {
   } catch { /* best-effort, exactly like railsEvent */ }
 }
 
-module.exports = { stampScan, stampPoll, buildScanRow, buildPollRow, derive, SCHEMA };
+// stampOpenAttempt(ctx): ctx = { paperDir, at, instance, pool, bookId,
+//   result, skipReason, syncGroup }. Best-effort, never throws.
+function stampOpenAttempt(ctx) {
+  try {
+    if (!enabled() || !ctx || !ctx.paperDir) return;
+    appendRows(ctx.paperDir, [buildOpenAttemptRow(ctx)]);
+  } catch { /* best-effort, exactly like railsEvent */ }
+}
+
+module.exports = { stampScan, stampPoll, stampOpenAttempt, buildScanRow, buildPollRow, buildOpenAttemptRow, derive, ftBandOf, SCHEMA };

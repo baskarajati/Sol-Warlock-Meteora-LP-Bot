@@ -54,6 +54,9 @@ const slBlacklist=require('./paper-sl-blacklist');
 const walletStore = require('./wallet-store');
 const liveControl = require('./live-control');
 const liveHalt = require('./live-halt');   // Item 1: per-book safety-halt enforcement (K1-K8, latch, feed rules)
+const configLoader = require('./config-loader'); // system-configurable v1: strategy params live in config/warlock-config.json, loaded at start
+const h17 = require('./h17-reject');   // H17 pump-cliff reject (deep-analysis §5.7 test #1, config-gated)
+const paperHalt = require('./paper-halt');   // register #13: code-enforced halt executor for the paper books (deep-analysis §5.5)
 const shadowStamps = require('./shadow-stamps'); // stamps-v1: logging-only shadow stamps (best-effort, no decision-path use)
 
 const DIR = process.env.LP_BOT_DIR || '/workspace/lp-bot';
@@ -90,48 +93,130 @@ if (!DRY) { // Tuan rule: live must be identical to dry run (one setting set, sa
   }
 }
 
+// System-configurable v1: the strategy comes from
+// config/warlock-config.json, loaded once here and validated fail-fast.
+// Profile: WARLOCK_PROFILE env, else the file's activeProfile
+// ('e-baseline'). An unreadable or invalid config refuses the start
+// outright — the bot never runs on a guessed number.
+let WARLOCK_CONFIG;
+try {
+  WARLOCK_CONFIG = configLoader.loadConfig();
+} catch (e) {
+  console.error('REFUSING START: ' + e.message);
+  process.exit(1);
+}
+const WC = WARLOCK_CONFIG.profile; // resolved, validated profile
+// Per-book paper halt executors (register #13, deep-analysis §5.5),
+// one per variant book, persisted in PAPER_DIR (halt-<book>.json +
+// HALT-<book>). Created lazily; a restart never auto-clears a trip.
+const paperHaltByBook = new Map();
+function paperHaltFor(bookId) {
+  let h = paperHaltByBook.get(bookId);
+  if (!h) { h = paperHalt.create({ bookId, dir: PAPER_DIR, params: WC.paperHalt, log }); paperHaltByBook.set(bookId, h); }
+  return h;
+}
+
 const CFG = {
+  // System-configurable v1: EVERY strategy number below comes from
+  // config/warlock-config.json (resolved profile WC), loaded once at
+  // start and validated fail-fast — there are no literal fallbacks left
+  // here for the moved parameters. Runtime overlay precedence (unchanged):
+  // config file (start defaults) < paper/settings.json < env, applied by
+  // applyPaperSettings() via paper-settings.currentValues(). Profile:
+  // WARLOCK_PROFILE env, else the file's activeProfile.
   PAPER, DRY_RUN: DRY,
   ONCE: process.argv.includes('--once'),
   RPC: require('./rpc-config').url(),   // custom SOLANA_RPC_URL > HELIUS_API_KEY > public endpoint
-  POLL_SEC: +(process.env.POLL_SEC || 300),
-  POSITION_SOL: +(process.env.POSITION_SOL || 2),
-  POSITION_USD: process.env.POSITION_USD ? +process.env.POSITION_USD : 0,
-  RESERVE_SOL: +(process.env.RESERVE_SOL || 0.15),
-  TP: +(process.env.TP || 0.20),
-  MAX_HOURS: +(process.env.MAX_HOURS || 12),
-  // Fee/TVL: period fees / current TVL from Meteora datapi (default 30m, >= 2%).
-  FT_WINDOW: (['30m','1h','2h','4h','12h','24h'].includes(process.env.FT_WINDOW) ? process.env.FT_WINDOW : '30m'),
-  MIN_FT: +(process.env.MIN_FT || 1),
-  MAX_PUMP1H: +(process.env.MAX_PUMP1H || 0.15),
-  MIN_AGE_H: +(process.env.MIN_AGE_H || 24),
-  MIN_LIQ_USD: +(process.env.MIN_LIQ_USD || 10000),
-  MAX_POS_TVL_FRAC: +(process.env.MAX_POS_TVL_FRAC || 0.05),
-  MAX_POSITIONS:5,CAPITAL_ASSET:'USDC',MAX_LIQ_USD:100000,MAX_NONREFUND_SOL:.05,REOPEN_COOLDOWN_MIN:30,MAX_PUMP24H_PCT:200,POSITION_USDC:0,UPPER_BUFFER_BINS:0,OOR_RIGHT_CONFIRM_POLLS:2,OOR_RIGHT_MIN_BINS:5,OOR_RIGHT_REPOSITION_MIN_PNL_PCT:-3,RUGCHECK_STICKY_DAYS:7,FEE_TURNOVER_MAX_PCT:60,FEE_TURNOVER_TVL_BELOW_USD:25000,OOR_RIGHT_MIN_PROFIT_PCT:.5,OOR_RIGHT_MAX_REPOSITIONS:2,
-  MIN_BIN_STEP: +(process.env.MIN_BIN_STEP || 100),
-  MAX_BIN_STEP: +(process.env.MAX_BIN_STEP || 400),
-  MIN_VOL_1H: +(process.env.MIN_VOL_1H || 1000),
-  MAX_PUMP_24H: +(process.env.MAX_PUMP_24H || 0.50),
-  VOL_SPIKE_1H_OF_24H: +(process.env.VOL_SPIKE_1H_OF_24H || 0.50),
-  EMERGENCY_DROP: +(process.env.EMERGENCY_DROP || 0.20),
-  DEPTH: +(process.env.DEPTH || 0.5),
-  SLIPPAGE_PCT: +(process.env.SLIPPAGE_PCT || 1),
-  PRIORITY_MICROLAMPORTS: +(process.env.PRIORITY_MICROLAMPORTS || 50000),
-  TX_FEE_SOL: +(process.env.TX_FEE_SOL || 0.000025),
+  POLL_SEC: WC.management.pollSec,
+  POSITION_SOL: WC.sizing.positionSol,
+  POSITION_USD: WC.sizing.positionUsdc,
+  RESERVE_SOL: WC.sizing.reserveSol,
+  TP: WARLOCK_CONFIG.derived.tpFraction,
+  TP_USD_PCT: WC.exits.tpUsdPct,
+  MAX_HOURS: WC.exits.maxHours,
+  // Fee/TVL: period fees / current TVL from Meteora datapi.
+  FT_WINDOW: WC.screening.ftWindow,
+  MIN_FT: WC.screening.minFt,
+  MAX_PUMP1H: WC.screening.maxPump1h,
+  MIN_AGE_H: WC.screening.minAgeH,
+  MIN_LIQ_USD: WC.screening.minLiqUsd,
+  MAX_POS_TVL_FRAC: WC.sizing.maxPosTvlFrac,
+  MAX_POSITIONS: WC.sizing.maxPositions,
+  CAPITAL_ASSET:'USDC',MAX_LIQ_USD:WC.screening.maxLiqUsd,MAX_NONREFUND_SOL:WC.screening.maxNonrefundSol,REOPEN_COOLDOWN_MIN:WC.screening.reopenCooldownMin,MAX_PUMP24H_PCT:WC.screening.maxPump24hPct,POSITION_USDC:WC.sizing.positionUsdc,UPPER_BUFFER_BINS:WC.geometry.upperBufferBins,OOR_RIGHT_CONFIRM_POLLS:WC.exits.oorRightConfirmPolls,OOR_RIGHT_MIN_BINS:WC.exits.oorRightMinBins,OOR_RIGHT_REPOSITION_MIN_PNL_PCT:WC.exits.oorRightRepositionMinPnlPct,RUGCHECK_STICKY_DAYS:WC.filters.rugcheckStickyDays,FEE_TURNOVER_MAX_PCT:WC.filters.feeTurnoverMaxPct,FEE_TURNOVER_TVL_BELOW_USD:WC.filters.feeTurnoverTvlBelowUsd,OOR_RIGHT_MIN_PROFIT_PCT:WC.exits.oorRightMinProfitPct,OOR_RIGHT_MAX_REPOSITIONS:WC.exits.oorRightMaxRepositions,
+  MIN_BIN_STEP: WC.screening.minBinStep,
+  MAX_BIN_STEP: WC.screening.maxBinStep,
+  MIN_VOL_1H: WC.screening.minVol1h,
+  MAX_PUMP_24H: WC.screening.maxPump24h,
+  VOL_SPIKE_1H_OF_24H: WC.screening.volSpike1hOf24h,
+  EMERGENCY_DROP: WC.exits.emergencyDrop,
+  EMERGENCY_TP_ENABLED: WC.exits.emergencyTpEnabled,
+  EMERGENCY_TP_TRIGGER_RANGE_PCT: WC.exits.emergencyTpTriggerRangePct,
+  EMERGENCY_TP_PCT: WC.exits.emergencyTpPct,
+  EMERGENCY_SLPLUS_ENABLED: WC.exits.slPlusEnabled,
+  EMERGENCY_SLPLUS_ARM_PCT: WC.exits.slPlusArmPct,
+  EMERGENCY_SLPLUS_LOCK_PCT: WC.exits.slPlusLockPct,
+  EMERGENCY_SLPLUS_CONFIRM_POLLS: WC.exits.slPlusConfirmPolls,
+  EMERGENCY_SLPLUS_FLOOR_PCT: WC.exits.slPlusFloorPct,
+  EMERGENCY_SLPLUS_FLOOR_POLLS: WC.exits.slPlusFloorPolls,
+  STALE_CLOSE_ENABLED: WC.exits.staleCloseEnabled,
+  STALE_EXIT_MODE: WC.exits.staleExitMode,
+  STALE_EXIT_PCT: WC.exits.staleExitPct,
+  OOR_RIGHT_CLOSE: WC.exits.oorRightClose,
+  OOR_MAX_MIN: WC.exits.oorMaxMin,
+  TRAIL_ENABLED: WC.exits.trailEnabled,
+  TRAIL_ARM_PCT: WC.exits.trailArmPct,
+  TRAIL_DROP_PCT: WC.exits.trailDropPct,
+  QUOTE_FAILURE_POLLS: WC.exits.quoteFailurePolls,
+  RANGE_DOWN_PCT: WC.geometry.rangeDownPct,
+  LOWER_BINS: WC.geometry.lowerBins,
+  RANGE_UP_PCT: WC.geometry.rangeUpPct,
+  OPEN_SPOT_PCT: WC.geometry.openSpotPct,
+  COMPOUND_SPOT_PCT: WC.geometry.compoundSpotPct,
+  OPEN_SHAPE: WC.geometry.openShape,
+  RESHAPE_SHAPE: WC.geometry.reshapeShape,
+  MAX_POSITION_TVL_PCT: WC.geometry.maxPositionTvlPct,
+  RESHAPE_ENABLED: WC.reshape.reshapeEnabled,
+  COMPOUND_ENABLED: WC.reshape.compoundEnabled,
+  RESHAPE_N: WC.reshape.reshapeN,
+  FILTERS_ENABLED: WC.filters.filtersEnabled,
+  PUMP1H_FILTER_ENABLED: WC.filters.pump1hFilterEnabled,
+  PUMP24H_FILTER_ENABLED: WC.filters.pump24hFilterEnabled,
+  RUGCHECK_ENABLED: WC.filters.rugcheckEnabled,
+  TOP_HOLDERS_ENABLED: WC.filters.checkTopHolders,
+  CHECK_INSIDERS: WC.filters.checkInsiders,
+  MAX_INSIDER_PCT: WC.filters.maxInsiderPct,
+  ANTI_PVP_MODE: WC.filters.antiPvpMode,
+  ANTI_PVP_MIN_LIQ_USD: WC.filters.antiPvpMinLiqUsd,
+  OLD_DUMP_FILTER_ENABLED: WC.filters.oldDumpFilterEnabled,
+  OLD_TOKEN_MODE: WC.filters.oldTokenMode,
+  OLD_DUMP_MIN_AGE_H: WC.filters.oldDumpMinAgeH,
+  OLD_DUMP_MAX_PUMP24H: WC.filters.oldDumpMaxPump24h,
+  TVL_DROP_FILTER_ENABLED: WC.filters.tvlDropFilterEnabled,
+  TVL_DROP_MAX_PCT: WC.filters.tvlDropMaxPct,
+  SL_BLACKLIST_ENABLED: WC.filters.slBlacklistEnabled,
+  NOTIFY_RESHAPE: false,
+  H17_ENABLED: WC.h17.enabled,
+  H17_PUMP24H_MIN: WC.h17.pump24hMin,
+  H17_PUMP1H_LOW: WC.h17.pump1hLow,
+  H17_PUMP1H_HIGH: WC.h17.pump1hHigh,
+  DEPTH: WC.execution.depth,
+  SLIPPAGE_PCT: WC.execution.slippagePct,
+  PRIORITY_MICROLAMPORTS: WC.execution.priorityMicrolamports,
+  TX_FEE_SOL: WC.execution.txFeeSol,
   // Anti-rug checks default ON (set RUGCHECK=0 or CHECK_TOP_HOLDERS=0 to disable).
-  RUGCHECK: process.env.RUGCHECK !== '0',
-  MAX_RUGCHECK_SCORE_NORM: +(process.env.MAX_RUGCHECK_SCORE_NORM || 50),
-  CHECK_TOP_HOLDERS: process.env.CHECK_TOP_HOLDERS !== '0',
-  MAX_TOP10_HOLD: +(process.env.MAX_TOP10_HOLD || 0.30),
-  MAX_DEV_HOLD: +(process.env.MAX_DEV_HOLD || 0.10),
+  RUGCHECK: process.env.RUGCHECK !== '0' && WC.filters.rugcheckEnabled,
+  MAX_RUGCHECK_SCORE_NORM: WC.filters.maxRugcheckScoreNorm,
+  CHECK_TOP_HOLDERS: process.env.CHECK_TOP_HOLDERS !== '0' && WC.filters.checkTopHolders,
+  MAX_TOP10_HOLD: WC.filters.maxTop10Hold,
+  MAX_DEV_HOLD: WC.filters.maxDevHold,
   // Live reshape remains opt-in (RESHAPE=1). Paper always runs the shadow variant set below.
   RESHAPE: process.env.RESHAPE === '1',
-  RESHAPE_MAX: +(process.env.RESHAPE_MAX || 5),   // Item 1: per-leg reshape cap (closes OPEN-3); settings.json wins via applyPaperSettings
-  PAPER_VIRTUAL_SOL: +(process.env.PAPER_VIRTUAL_SOL || 5.30),
-  PAPER_USDC: +(process.env.PAPER_USDC || paperCap.DEFAULT_USDC_START),
-  USDC_BUFFER: +(process.env.USDC_BUFFER || paperCap.DEFAULT_USDC_BUFFER),
-  GAS_BUFFER_SOL: +(process.env.GAS_BUFFER_SOL || paperCap.DEFAULT_GAS_BUFFER_SOL),
-  PAPER_DAYS: +(process.env.PAPER_DAYS || 7),
+  RESHAPE_MAX: WC.reshape.reshapeMax,   // Item 1: per-leg reshape cap (closes OPEN-3); settings.json wins via applyPaperSettings
+  PAPER_VIRTUAL_SOL: WC.management.paperVirtualSol,
+  PAPER_USDC: WC.management.paperUsdc,
+  USDC_BUFFER: WC.sizing.usdcBuffer,
+  GAS_BUFFER_SOL: WC.sizing.gasBufferSol,
+  PAPER_DAYS: WC.management.paperDays,
 };
 
 // Parallel paper variants share one entry decision. Reshape trigger = price dropped N bins
@@ -159,7 +244,8 @@ const VARIANT_SETTINGS = {
   D: { TRAIL_ENABLED: true, TRAIL_ARM_PCT: 3, TRAIL_DROP_PCT: 1.0, EMERGENCY_SLPLUS_ENABLED: false },
   // E: freeze reshaping after the 5th reshape. Position stays open; -20% emergency stop,
   // TP, emergency TP, SL+ and 12h max-age all stay live. See the freeze gate in paperCycle.
-  E: { RESHAPE_MAX: 5 },
+  // The cap comes from the config (reshape.reshapeMax), not a literal.
+  E: { RESHAPE_MAX: WC.reshape.reshapeMax },
   // B7 (B'): flat TP 7% — BOTH the normal TP and the deep-leg emergency TP become 7%.
   B7: { TP_USD_PCT: 7, TP: 0.07, EMERGENCY_TP_PCT: 7 },
 };
@@ -510,21 +596,21 @@ async function performScan(policy,opts={}) {
   const fOn = (k) => ({ PUMP1H_FILTER_ENABLED: ff.pump1h, PUMP24H_FILTER_ENABLED: ff.pump24h, CHECK_INSIDERS: ff.insiders })[k];
   const pvpMode = ff.antiPvp;
   const pvpUniverse = [...seen.values()].map(antiPvp.fromPool);
-  log(`token filters: master=${filtersOn ? 'ON' : 'OFF'} pump1h=${fOn('PUMP1H_FILTER_ENABLED')} pump24h=${fOn('PUMP24H_FILTER_ENABLED')} rugcheck=${!!policy.RUGCHECK} topHolders=${!!policy.CHECK_TOP_HOLDERS} insiders=${fOn('CHECK_INSIDERS')}(<=${policy.MAX_INSIDER_PCT ?? 25}%) antiPvp=${pvpMode}(twin liq>=$${policy.ANTI_PVP_MIN_LIQ_USD ?? 10000}) tvlDrop=${ff.tvlDrop}(>=${policy.TVL_DROP_MAX_PCT ?? 45}%) slBlacklist=${policy.SL_BLACKLIST_ENABLED !== false}`);
+  log(`token filters: master=${filtersOn ? 'ON' : 'OFF'} pump1h=${fOn('PUMP1H_FILTER_ENABLED')} pump24h=${fOn('PUMP24H_FILTER_ENABLED')} rugcheck=${!!policy.RUGCHECK} topHolders=${!!policy.CHECK_TOP_HOLDERS} insiders=${fOn('CHECK_INSIDERS')}(<=${policy.MAX_INSIDER_PCT ?? CFG.MAX_INSIDER_PCT}%) antiPvp=${pvpMode}(twin liq>=$${policy.ANTI_PVP_MIN_LIQ_USD ?? CFG.ANTI_PVP_MIN_LIQ_USD}) tvlDrop=${ff.tvlDrop}(>=${policy.TVL_DROP_MAX_PCT ?? CFG.TVL_DROP_MAX_PCT}%) slBlacklist=${policy.SL_BLACKLIST_ENABLED !== false}`);
   for (const p of c.slice(0,40)) {
     screeningPool = p;
     const ageH = (nowS - createdAtSec(p)) / 3600;
     const tag = `${p.name} ${p.address.slice(0, 6)} ft${policy.FT_WINDOW}=${(feeTvl(p) ?? 0).toFixed(2)}% tvl=$${p.tvl.toFixed(0)} age=${ageH.toFixed(1)}h bs=${p.pool_config.bin_step}`;
     if(policy.SL_BLACKLIST_ENABLED!==false&&slBlacklist.has(PAPER_DIR,p.token_x?.address)&&skipSoft(p,p.name,'SL blacklist'))continue;
     {const cooldown=entryPolicy.cooldownReason(recentHistory,p.address,policy.REOPEN_COOLDOWN_MIN);if(cooldown&&skipSoft(p,tag,cooldown))continue;}
-    if (ff.tvlDrop) { const ev = tvlDrop.evaluatePool(p, recentEntries, policy.TVL_DROP_MAX_PCT ?? 45); if (!ev.ok && skipSoft(p, tag, ev.why)) continue; }
-    if (ff.oldDump && policy.OLD_TOKEN_MODE === 'BLOCK_ALL') { const ot = antirug.evaluateOldToken(Number(p.created_at) > 0 ? ageH : null, policy.OLD_DUMP_MIN_AGE_H ?? 400); if (!ot.ok && skipSoft(p, tag, ot.why)) continue; }
+    if (ff.tvlDrop) { const ev = tvlDrop.evaluatePool(p, recentEntries, policy.TVL_DROP_MAX_PCT ?? CFG.TVL_DROP_MAX_PCT); if (!ev.ok && skipSoft(p, tag, ev.why)) continue; }
+    if (ff.oldDump && policy.OLD_TOKEN_MODE === 'BLOCK_ALL') { const ot = antirug.evaluateOldToken(Number(p.created_at) > 0 ? ageH : null, policy.OLD_DUMP_MIN_AGE_H ?? CFG.OLD_DUMP_MIN_AGE_H); if (!ot.ok && skipSoft(p, tag, ot.why)) continue; }
     {p.entryCostEstimate=await screenEntryCost(p,policy);const why=entryCost.rejection(p.entryCostEstimate,policy.MAX_NONREFUND_SOL??.05);if(why&&skipSoft(p,tag,why))continue;}
     let pvp = null;
     if (pvpMode !== 'OFF') {
       const ds = await dexSearchPairs(p.token_x?.symbol || p.name?.split('-')[0]);
       if (ds.error) log(`  anti PvP ${p.name}: dexscreener gagal (${ds.error}); pakai pool Meteora saja`);
-      pvp = antiPvp.evaluate({ self: antiPvp.fromPool(p), entries: [...pvpUniverse, ...ds.pairs.map(antiPvp.fromDexPair)], mode: pvpMode, minLiq: policy.ANTI_PVP_MIN_LIQ_USD ?? 10000 });
+      pvp = antiPvp.evaluate({ self: antiPvp.fromPool(p), entries: [...pvpUniverse, ...ds.pairs.map(antiPvp.fromDexPair)], mode: pvpMode, minLiq: policy.ANTI_PVP_MIN_LIQ_USD ?? CFG.ANTI_PVP_MIN_LIQ_USD });
       D(p).pvp = pvp;
       if (!pvp.ok && skipSoft(p, tag, pvp.why)) continue;
     }
@@ -543,17 +629,27 @@ async function performScan(policy,opts={}) {
     const pump24 = antirug.evaluatePump24h(pu24, policy.MAX_PUMP_24H);
     if(!pump24.ok&&skipSoft(p,tag,pump24.why))continue;
     }
-    if (ff.oldDump && policy.OLD_TOKEN_MODE !== 'BLOCK_ALL' && ageH > (policy.OLD_DUMP_MIN_AGE_H ?? 400)) {
+    if (ff.oldDump && policy.OLD_TOKEN_MODE !== 'BLOCK_ALL' && ageH > (policy.OLD_DUMP_MIN_AGE_H ?? CFG.OLD_DUMP_MIN_AGE_H)) {
       if (pu24 == null) { try { pu24 = await pump24h(p.address); } catch (e) { skip(tag, `token tua: ohlcv24 error ${e.message}`); await sleep(800); continue; } D(p).pu24 = pu24; }
-      const od = antirug.evaluateOldDump(ageH, pu24, policy.OLD_DUMP_MIN_AGE_H ?? 400, policy.OLD_DUMP_MAX_PUMP24H ?? 0);
+      const od = antirug.evaluateOldDump(ageH, pu24, policy.OLD_DUMP_MIN_AGE_H ?? CFG.OLD_DUMP_MIN_AGE_H, policy.OLD_DUMP_MAX_PUMP24H ?? CFG.OLD_DUMP_MAX_PUMP24H);
       if (!od.ok && skipSoft(p, tag, od.why)) continue;
+    }
+    // H17 pump-cliff reject (system-configurable v1, deep-analysis §5.7
+    // test #1): on top of the E baseline, reject pump24h >= +40% AND
+    // pump1h in [-20%, -5%]. Config-gated (h17.enabled: OFF in the
+    // e-baseline profile, ON in the h17 profile). A missing pump figure
+    // keeps the entry — H17 never starves the screen on missing data.
+    if (WC.h17.enabled) {
+      const h17v = h17.isH17Reject({ pump1h: pu, pump24h: pu24 }, WC.h17);
+      if (h17v.reject && skipSoft(p, tag, h17v.reason)) continue;
+      if (h17v.reason) log(`  h17 ${tag}: ${h17v.reason}`);
     }
     const m = await mintOk(p.token_x.address);
     D(p).mint = m;
     if (!m.ok) { skip(tag, m.why); continue; }
     let report = null, rcInfo = null;
     if (policy.RUGCHECK) {
-      const rs = await rugSticky.check({ dir: PAPER_DIR, mint: p.token_x.address, days: policy.RUGCHECK_STICKY_DAYS ?? 7, symbol: p.token_x.symbol || p.name, pool: p.address, fetch: fetchRugCheck, evaluate: (r) => antirug.evaluateRugCheck(r, policy), log });
+      const rs = await rugSticky.check({ dir: PAPER_DIR, mint: p.token_x.address, days: policy.RUGCHECK_STICKY_DAYS ?? CFG.RUGCHECK_STICKY_DAYS, symbol: p.token_x.symbol || p.name, pool: p.address, fetch: fetchRugCheck, evaluate: (r) => antirug.evaluateRugCheck(r, policy), log });
       report = rs.report; rcInfo = rs.rc;
       if (!rs.ok) { skip(tag, rs.why); continue; }
     }
@@ -652,12 +748,12 @@ async function performScan(policy,opts={}) {
           let pvp=d.pvp;
           if(pvp===undefined&&ffD.antiPvp!=='OFF'){const q=String(p.token_x?.symbol||p.name?.split('-')[0]||'').trim().toLowerCase(),hit=q&&dexSearchCache.get(q);let ds=null;
             if(hit&&Date.now()-hit.t<(hit.r.error?2*60_000:30*60_000))ds=hit.r;else if(q&&diagStats.dex<MAX_NEW&&canFetch()){diagStats.dex++;ds=await dexSearchPairs(q);await sleep(250);}
-            if(ds)pvp=antiPvp.evaluate({self:antiPvp.fromPool(p),entries:[...pvpUniverse,...ds.pairs.map(antiPvp.fromDexPair)],mode:ffD.antiPvp,minLiq:policy.ANTI_PVP_MIN_LIQ_USD??10000});}
+            if(ds)pvp=antiPvp.evaluate({self:antiPvp.fromPool(p),entries:[...pvpUniverse,...ds.pairs.map(antiPvp.fromDexPair)],mode:ffD.antiPvp,minLiq:policy.ANTI_PVP_MIN_LIQ_USD ?? CFG.ANTI_PVP_MIN_LIQ_USD});}
           let pu=d.pu,pu24=d.pu24,pumpSource=null;
-          if((ffD.pump1h&&pu===undefined)||((ffD.pump24h||(ffD.oldDump&&policy.OLD_TOKEN_MODE!=='BLOCK_ALL'&&(nowS-createdAtSec(p))/3600>(policy.OLD_DUMP_MIN_AGE_H??400)))&&pu24===undefined)){const pr=await diagPair(p.address,()=>diagStats.pair<MAX_NEW&&canFetch()&&(diagStats.pair++,true));if(pr){if(pu===undefined)pu=pr.h1;if(pu24===undefined)pu24=pr.h24;pumpSource='DexScreener';}}
+          if((ffD.pump1h&&pu===undefined)||((ffD.pump24h||(ffD.oldDump&&policy.OLD_TOKEN_MODE!=='BLOCK_ALL'&&(nowS-createdAtSec(p))/3600>(policy.OLD_DUMP_MIN_AGE_H ?? CFG.OLD_DUMP_MIN_AGE_H)))&&pu24===undefined)){const pr=await diagPair(p.address,()=>diagStats.pair<MAX_NEW&&canFetch()&&(diagStats.pair++,true));if(pr){if(pu===undefined)pu=pr.h1;if(pu24===undefined)pu24=pr.h24;pumpSource='DexScreener';}}
           const list=screenReasons.evaluate(p,{policy,nowS,flags:ffD,sl:mint?slMints[mint]||null:null,cooldown:policy.PAPER?entryPolicy.cooldownReason(recentHistory,p.address,policy.REOPEN_COOLDOWN_MIN):null,
             open:{samePool:openPos.some(x=>x.pool===p.address),caPoolName:(openPos.find(x=>x.mintX===mint&&x.pool!==p.address)||{}).name||null,count:openPos.length,max:policy.MAX_POSITIONS},
-            entryCost:p.entryCostEstimate||undefined,pu,pu24,pumpSource,mint:d.mint,report,pvp,rugSticky:mint&&policy.RUGCHECK&&(policy.RUGCHECK_STICKY_DAYS??7)>0?rugSticky.get(PAPER_DIR,mint,policy.RUGCHECK_STICKY_DAYS??7):null,holdersExclude:[p.reserve_x,p.address],
+            entryCost:p.entryCostEstimate||undefined,pu,pu24,pumpSource,mint:d.mint,report,pvp,rugSticky:mint&&policy.RUGCHECK&&(policy.RUGCHECK_STICKY_DAYS ?? CFG.RUGCHECK_STICKY_DAYS)>0?rugSticky.get(PAPER_DIR,mint,policy.RUGCHECK_STICKY_DAYS ?? CFG.RUGCHECK_STICKY_DAYS):null,holdersExclude:[p.reserve_x,p.address],
             prevTvl:tvlDrop.entryTvl(tvlDrop.previousEntry(recentEntries.concat(openPos),p))});
           diagStats.unchecked+=list.filter(x=>x.s==='unchecked').length;diagReasons.set(p.address,list);diagLatest.set(p.address,{pu,pu24,report});
         }
@@ -1230,7 +1326,7 @@ function applyPaperSettings({ logAlways = false } = {}) {
 }
 
 // ---------- paper valuation / fees / open / reshape / close ----------
-async function fetchMarket(pool, minBinId, maxBinId) {
+async function fetchMarket(pool, minBinId, maxBinId, pos = null) {
   const dlmm = await DLMM.create(conn, new PublicKey(pool));
   const active = await dlmm.getActiveBin();
   const price = +dlmm.fromPricePerLamport(+active.price);
@@ -1239,7 +1335,7 @@ async function fetchMarket(pool, minBinId, maxBinId) {
   const { map } = await readPoolBins(dlmm, minB, maxB);
   let stats = null;
   try { stats = await fetchPool(pool); } catch (e) { log('pool stats: ' + e.message); }
-  try { shadowStamps.stampPoll({ paperDir: PAPER_DIR, at: now(), instance: 'B1', record: stats, feeTvlFn: (x, w) => feeTvl(x, w) }); } catch { /* stamps-v1: best-effort */ }
+  try { shadowStamps.stampPoll({ paperDir: PAPER_DIR, at: now(), instance: 'B1', record: stats, feeTvlFn: (x, w) => feeTvl(x, w), position: pos }); } catch { /* stamps-v1: best-effort */ }
   const pxUsd = await solUsd();
   let estimatedTokenSwapFeeRate=(+(stats?.pool_config?.base_fee_pct??.3))/100;
   try{const totalPct=+dlmm.getDynamicFee();if(Number.isFinite(totalPct)&&totalPct>=0)estimatedTokenSwapFeeRate=totalPct/100;}catch{}
@@ -1296,7 +1392,7 @@ async function initialPaperBins(dlmm,p,{minBinId,maxBinId,activeBin,depositQuote
  if(right>0){buy=await jupiterQuote(quoteMint,p.token_x.address,BigInt(Math.floor(tokenSpendQuote*10**quoteDecimals)),quoteDecimals,decX);
  if(!buy.ok||!(buy.outUi>0))throw Error('Token-side Jupiter quote failed: '+(buy.error||'empty'));}
  const entryTokenX=buy.outUi,rows=[];
- const spot=policy.OPEN_SHAPE==='SPOT'?1:policy.OPEN_SHAPE==='BIDASK'?0:(policy.OPEN_SPOT_PCT??50)/100;
+ const spot=policy.OPEN_SHAPE==='SPOT'?1:policy.OPEN_SHAPE==='BIDASK'?0:(policy.OPEN_SPOT_PCT ?? CFG.OPEN_SPOT_PCT)/100;
  for(const [strategyType,weight] of [[StrategyType.Spot,spot],[StrategyType.BidAsk,1-spot]]){
   if(weight===0)continue;
   rows.push(...await strategyAmounts(dlmm,{minBinId,maxBinId:activeBin,amountX:0,amountY:entryQuoteY*weight,strategyType}));
@@ -1326,7 +1422,7 @@ async function paperOpenUsdc(p,state,opts={}) {
    funding=await capitalAsset.exchange(opts.positionBudgetSol-gas.buffer,'SOL','USDC',px,jupiterQuote,CFG.TX_FEE_SOL);
    book0.virtual.usdc=funding.out;book0.virtual.sol=gas.buffer;capitalSpentSol=opts.positionBudgetSol;
   }
-  const plan=await paperUsdc.planUsdcOpen({cash:Math.min(book0.virtual.usdc,opts.positionBudgetUsdc??(CFG.POSITION_USDC>0?CFG.POSITION_USDC:book0.virtual.usdc)),existingSol:book0.virtual.sol||0,capUsd:(p.tvl||0)*((policy.MAX_POSITION_TVL_PCT??5)/100),
+  const plan=await paperUsdc.planUsdcOpen({cash:Math.min(book0.virtual.usdc,opts.positionBudgetUsdc??(CFG.POSITION_USDC>0?CFG.POSITION_USDC:book0.virtual.usdc)),existingSol:book0.virtual.sol||0,capUsd:(p.tvl||0)*((policy.MAX_POSITION_TVL_PCT ?? CFG.MAX_POSITION_TVL_PCT)/100),
     gasBuffer:gas.buffer,rentRef,rentNon,openFees,solUsd:px,usdcBuffer:opts.capitalAsset==='SOL'?0:CFG.USDC_BUFFER,quote:jupiterQuote});
   if(!plan.ok){log('USDC open skipped: '+plan.why);return {skipped:plan.why};}
   if(funding){const unused=Math.max(0,book0.virtual.usdc-plan.usdcSpent);if(unused>1e-6){const back=await capitalAsset.exchange(unused,'USDC','SOL',px,jupiterQuote,CFG.TX_FEE_SOL);capitalSpentSol-=back.out;}book0.virtual.usdc=plan.usdcSpent;}
@@ -1338,7 +1434,7 @@ async function paperOpenUsdc(p,state,opts={}) {
     quoteMint:USDC,quoteSymbol:'USDC',quoteDecimals:6,depositQuote:plan.depositQuote,feesCompoundedQuote:0,
     minBinId,maxBinId,origMinBinId:minBinId,origMaxBinId:maxBinId,nBins:n+strategy.geometry(binStep,policy,MAX_BINS).upper,binStep,upperBufferBins:strategy.geometry(binStep,policy,MAX_BINS).upper,entryTokenX:shape.entryTokenX,entryQuoteY:shape.entryQuoteY,
     rangePct:-(1-Math.pow(1+binStep/1e4,-n))*100,entryPrice:priceUi,entryActiveBin:active.binId,
-    openedAt:now(),entryWib:wib(),tvlUsd:p.tvl,tvlCapped:plan.depositQuote>=(p.tvl||0)*((policy.MAX_POSITION_TVL_PCT??5)/100)-1e-6,
+    openedAt:now(),entryWib:wib(),tvlUsd:p.tvl,tvlCapped:plan.depositQuote>=(p.tvl||0)*((policy.MAX_POSITION_TVL_PCT ?? CFG.MAX_POSITION_TVL_PCT)/100)-1e-6,
     baseFeePct:p.pool_config?.base_fee_pct??null,poolFees24hUsd:p.fees?.['24h']??null,lastPrice:priceUi,lastSolUsd:px,solUsdEntry:px,
     shape:'open-'+String(policy.OPEN_SHAPE||'MIXED').toLowerCase(),spotQuote:shape.entryQuoteY*split,bidaskQuote:shape.entryQuoteY*(1-split),usdcIn:capitalSpentSol!=null?capitalSpentSol*px:plan.usdcIn,usdcSpent:plan.usdcSpent,solCarryInUsd:plan.solCarryInUsd,
     solBought:plan.boughtSol,gasBufferSol:gas.buffer,gasUsdc:plan.gasUsdc,leftoverSolAtOpen:plan.reserve,openSwapCostUsd:plan.openSwapCostUsd+shape.tokenSwapCostQuote+(funding?.costUsd||0),
@@ -1347,7 +1443,8 @@ async function paperOpenUsdc(p,state,opts={}) {
     lastActiveBin:active.binId,lastReshapeActiveBin:active.binId,reshapes:0};
   const sdkBuild=cost.skipCheck?{ok:true,skipped:'PAPER wide-range: optional build/rent RPC not awaited'}:await buildOpenTxs(dlmm,template,half);
   const openedVariants=[];
-  for(const v of VARIANTS.filter(v=>state.books[v.id])){
+  for(const v of VARIANTS.filter(v=>state.books[v.id] && !paperHaltFor(v.id).canOpen().ok)) log(`HALT refuses open into [${v.id}]: ${paperHaltFor(v.id).canOpen().reason}`);
+  for(const v of VARIANTS.filter(v=>state.books[v.id] && paperHaltFor(v.id).canOpen().ok)){
     const book=state.books[v.id];
     // Per-variant stamp: the SAME entry, but this book's position carries its own frozen
     // settings (merged over the shared control policy). Exit/reshape read them via
@@ -1376,7 +1473,11 @@ async function paperOpenAll(p,state,opts={}) {
  // take it is skipped for this entry only; the others still open. The old code gated
  // on the control book alone, which would have blocked or duplicated entries per book.
  const openable = (b) => b && multi.positions(b).length < CFG.MAX_POSITIONS && !multi.duplicate(b, p.address, p.token_x?.address);
- if(!VARIANTS.some((v) => openable(state.books[v.id])))return {skipped:'Slot penuh / token sudah dibuka di semua varian'};
+ // Register #13: a halted book takes no new opens (canOpen() is false
+ // once its halt latches). The halt is checked here and in paperCycle's
+ // canOpenInSomeBook and again in the paperOpenUsdc fan-out below.
+ const haltOpenable = (v) => paperHaltFor(v.id).canOpen().ok;
+ if(!VARIANTS.some((v) => haltOpenable(v) && openable(state.books[v.id])))return {skipped:'Slot penuh / token sudah dibuka di semua varian / book halted'};
  if((book.virtual.capitalAsset||'USDC')==='SOL'){
   // SOL-capital path: single-book (control A) only, by design. Window 2 is USDC-only
   // (paper-runs rejects a new run unless every book is USDC), so this path does not
@@ -1392,7 +1493,7 @@ async function paperOpenAll(p,state,opts={}) {
  }
  // USDC path (Window 2): one leg per openable variant book, one shared paperOpenSingle
  // call so the entry quote/plan/geometry is computed once and stamped into each book.
- const targets=VARIANTS.filter((v) => openable(state.books[v.id]) && multi.budget(state.books[v.id], CFG) > 1);
+ const targets=VARIANTS.filter((v) => haltOpenable(v) && openable(state.books[v.id]) && multi.budget(state.books[v.id], CFG) > 1);
  if(!targets.length)return {skipped:'Saldo USDC tidak cukup'};
  const legs={},allocations={};
  for(const v of targets){const b=state.books[v.id];allocations[v.id]=multi.budget(b,CFG);legs[v.id]={...b,positions:undefined,position:null,virtual:{...b.virtual,usdc:allocations[v.id],sol:0}};}
@@ -1435,7 +1536,7 @@ async function paperOpenSingle(p, state,opts={}) {
   const spend = opts.capitalAsset==='SOL'?{ok:opts.positionBudgetSol>extraSol,why:'SOL budget cannot cover gas buffer',usdcToSwap:opts.positionBudgetSol*px,usdcForPosition:Math.max(0,opts.positionBudgetSol-extraSol)*px,capped:false}:paperCap.planOpenSpend({
     usdcCash: Math.min(book0?.virtual?.usdc||0,opts.positionBudgetUsdc??(CFG.POSITION_USDC>0?CFG.POSITION_USDC:book0?.virtual?.usdc||0)),
     usdcBuffer: CFG.USDC_BUFFER,
-    capUsd: (p.tvl || 0) * ((policy.MAX_POSITION_TVL_PCT??5)/100),
+    capUsd: (p.tvl || 0) * ((policy.MAX_POSITION_TVL_PCT ?? CFG.MAX_POSITION_TVL_PCT)/100),
     extraSol,
     solUsd: px,
   });
@@ -1456,7 +1557,7 @@ async function paperOpenSingle(p, state,opts={}) {
     log(`  NOT opening: ${alloc.why} (bought ${qOpen.outUi.toFixed(6)} SOL)`);
     return { skipped: alloc.why, solBought: qOpen.outUi };
   }
-  const capSol = ((p.tvl || 0) * ((policy.MAX_POSITION_TVL_PCT??5)/100)) / px;
+  const capSol = ((p.tvl || 0) * ((policy.MAX_POSITION_TVL_PCT ?? CFG.MAX_POSITION_TVL_PCT)/100)) / px;
   let deposit = alloc.deposit;
   let reserve = alloc.reserve;
   if (deposit > capSol) {
@@ -1468,7 +1569,7 @@ async function paperOpenSingle(p, state,opts={}) {
     actual: deposit,
     capped: spend.capped || deposit + 1e-12 < spend.usdcForPosition / px,
     tvlUsd: p.tvl,
-    capUsd: (p.tvl || 0) * ((policy.MAX_POSITION_TVL_PCT??5)/100),
+    capUsd: (p.tvl || 0) * ((policy.MAX_POSITION_TVL_PCT ?? CFG.MAX_POSITION_TVL_PCT)/100),
     solUsd: px,
   };
   const shape=await initialPaperBins(dlmm,p,{minBinId,maxBinId,activeBin:active.binId,depositQuote:deposit,price:priceUi,quoteMint:SOL,quoteDecimals:9,policy});
@@ -1594,7 +1695,7 @@ async function compoundFeesToLeft(pos, snap, tag = '') {
     log(`  ${tag}cannot compound SOL fees to the left: no bins below active and cannot extend`);
     return { added: 0, skipped: 'no left bins' };
   }
-  const weight=(pos.strategySettings?.COMPOUND_SPOT_PCT??50)/100;
+  const weight=(pos.strategySettings?.COMPOUND_SPOT_PCT ?? CFG.COMPOUND_SPOT_PCT)/100;
   const half = feeY * weight;
   const spot = weight>0?await strategyAmounts(snap.dlmm, { minBinId: Math.min(...leftIds), maxBinId: Math.max(...leftIds), amountX: 0, amountY: half, strategyType: StrategyType.Spot }):[];
   const bid = weight<1?await strategyAmounts(snap.dlmm, { minBinId: Math.min(...leftIds), maxBinId: Math.max(...leftIds), amountX: 0, amountY: feeY-half, strategyType: StrategyType.BidAsk }):[];
@@ -1781,6 +1882,11 @@ async function paperClose(book,variant,reason,snap,quoteCache={},exitVal=null,op
  Object.assign(rec,quotePnl.calculate({pos,valueQuote:snap.value??markValue(pos.bins,snap.price,pos.feeX||0,pos.feeY||0),solUsd:snap.pxUsd,val}));
  if(pos.capitalAsset==='SOL')book.virtual.capitalSol=(book.virtual.capitalSol||0)+val.solOut;else book.virtual.usdc=(book.virtual.usdc||0)+val.usdcOut;book.virtual.sol=0;
  if(!opts.intermediate)book.history.push(rec);book.position=null;
+ // Register #13 (system-configurable v1, deep-analysis §5.5): every final
+ // paper close feeds the per-book halt executor. A trip latches the book
+ // (HALT-<book>); intermediate reposition legs are not closed legs and
+ // are never recorded here.
+ if(!opts.intermediate){try{const r=paperHaltFor(variant.id).recordClose({pnlUsd:val.pnlUsd,reason,pool:pos.pool,openedAt:pos.openedAt});if(r.tripped)log(`HALT [${variant.id}] book halted (${r.tripped.criterion}); no new opens into this book`);}catch(e){log(`paper-halt record [${variant.id}] failed: ${e.message}`);}}
  // SL blacklist: record every stop-loss close by token mint (recorded even if the rule is off; the rule controls skipping).
  if(!opts.intermediate&&slBlacklist.isStopLoss(reason))try{if(slBlacklist.add(PAPER_DIR,{mint:pos.mintX,symbol:pos.name,pool:pos.pool,reason,closedAt:rec.closedAt,source:'auto'})){const l='SL blacklist add '+pos.name+' '+pos.mintX;log(l);paperSettings.audit(PAPER_DIR,'action='+l);}}catch(e){log('SL blacklist add failed: '+e.message);}
  if(!opts.silent)log(`${tag}CLOSE ${pos.name} reason=${reason} pnlUsd=${val.pnlUsd.toFixed(4)} (${val.pnlPct.toFixed(3)}%) usdc ${pos.usdcIn.toFixed(4)}->${val.usdcOut.toFixed(4)} swapCostUsd=${swapCostUsd.toFixed(4)} gasUsed=${gasUsed.toFixed(6)} quote=${rec.quoteSymbol} basis=${val.valuationBasis} usdcCash=${book.virtual.usdc.toFixed(4)} ${quotePnl.logFields(rec)}`);
@@ -1897,9 +2003,9 @@ async function processPaperRequests(state){
 
 function exitQuotePriority(p){
  const c={...CFG,...(p.strategySettings||{})},active=p.lastActiveBin,pct=p.lastLive?.pnlPct??p.lastPnlPctUsdc;
- if((Number.isFinite(pct)&&pct<=-100*(c.EMERGENCY_DROP??.2))||paperExit.staleCheck(p,{pnlPct:pct},{...c,MAX_HOURS:c.MAX_HOURS??12}).close)return 5;
+ if((Number.isFinite(pct)&&pct<=-100*(c.EMERGENCY_DROP ?? CFG.EMERGENCY_DROP))||paperExit.staleCheck(p,{pnlPct:pct},{...c,MAX_HOURS: c.MAX_HOURS ?? CFG.MAX_HOURS}).close)return 5;
  const tpEff=paperExit.effectiveTp(p,c).pct;
- if((active>p.maxBinId&&((active-p.maxBinId)>=(c.OOR_RIGHT_MIN_BINS??0)||(Number.isFinite(pct)&&pct>=(c.OOR_RIGHT_MIN_PROFIT_PCT??.5))))||(Number.isFinite(pct)&&pct>=tpEff))return 4;   // just above the range and waiting (net below take-profit) is not 'about to exit'
+ if((active>p.maxBinId&&((active-p.maxBinId)>=(c.OOR_RIGHT_MIN_BINS ?? CFG.OOR_RIGHT_MIN_BINS)||(Number.isFinite(pct)&&pct>=(c.OOR_RIGHT_MIN_PROFIT_PCT ?? CFG.OOR_RIGHT_MIN_PROFIT_PCT))))||(Number.isFinite(pct)&&pct>=tpEff))return 4;   // just above the range and waiting (net below take-profit) is not 'about to exit'
  if(active>=p.maxBinId-1||(Number.isFinite(pct)&&pct>=tpEff-1))return 1;
  return 0;
 }
@@ -1914,7 +2020,7 @@ async function paperCycle(state) {
  // (a variant may close while others stay open), so entry/exit gating is computed
  // across ALL books; the shared entry still opens into every book that can take it.
  const allOpenPositions=()=>VARIANTS.flatMap((x)=>multi.positions(state.books[x.id]||{}));
- const canOpenInSomeBook=(p)=>VARIANTS.some((x)=>{const b=state.books[x.id];return b&&multi.positions(b).length<CFG.MAX_POSITIONS&&!multi.duplicate(b,p.address,p.token_x?.address);});
+ const canOpenInSomeBook=(p)=>VARIANTS.some((x)=>{const b=state.books[x.id];return b&&paperHaltFor(x.id).canOpen().ok&&multi.positions(b).length<CFG.MAX_POSITIONS&&!multi.duplicate(b,p.address,p.token_x?.address);});
  const scanFresh=!!(scan.last&&scan.picks&&scan.last.at!==state.lastScan?.at),entryRetry=!!(state.nextEntryRetryAt&&Date.now()>=state.nextEntryRetryAt),exitWaiting=allOpenPositions().some(p=>exitQuotePriority(p)>=4),entryWaiting=!!(!exitWaiting&&scan.last&&scan.picks?.some(canOpenInSomeBook)&&(scanFresh||entryRetry)&&!stop&&!screenRefresh.status(PAPER_DIR,CFG,scan.last).stale);
  // A pending entry reserves quote capacity; OOR, TP, emergency and trailing still request real quotes.
 
@@ -1924,7 +2030,7 @@ async function paperCycle(state) {
   for(const original of [...multi.positions(vBook)].sort((a,b)=>exitQuotePriority(b)-exitQuotePriority(a))){
   const book=multi.view(vBook,original),pos=book.position;
   try{
-   const mkt=await fetchMarket(pos.pool,pos.minBinId,pos.maxBinId);pos.priceUnavailablePolls=0;
+   const mkt=await fetchMarket(pos.pool,pos.minBinId,pos.maxBinId,pos);pos.priceUnavailablePolls=0;
    const sdkCache={},quoteCache={};
       let snap=applySnapshotToPos(pos,mkt);
       // Old positions are migrated in place; inventory/capital/open time are never reset.
@@ -1934,7 +2040,7 @@ async function paperCycle(state) {
       if((entryWaiting||(pos.lastQuoteAt&&Date.now()-pos.lastQuoteAt<QUOTE_REFRESH_MS))&&snap.inRange){
        val=await paperUsdc.exitQuote({pos,book,snap,quote:async()=>({ok:false,error:'Quote capacity reserved for pending entry; on-chain mark'}),txFee:CFG.TX_FEE_SOL});
        const risk={...CFG,...(pos.strategySettings||{})};
-       if(risk.TRAIL_ENABLED||val.pnlPct>=paperExit.effectiveTp(pos,risk).pct-1||val.pnlPct<=-100*(risk.EMERGENCY_DROP??.2)+1||(pos.slPlusArmed&&val.pnlPct<=Number(risk.EMERGENCY_SLPLUS_LOCK_PCT??0.1)+1))val=await paperUsdc.exitQuote({pos,book,snap,quote:jupiterQuote,txFee:CFG.TX_FEE_SOL});
+       if(risk.TRAIL_ENABLED||val.pnlPct>=paperExit.effectiveTp(pos,risk).pct-1||val.pnlPct<=-100*(risk.EMERGENCY_DROP ?? CFG.EMERGENCY_DROP)+1||(pos.slPlusArmed&&val.pnlPct<=Number(risk.EMERGENCY_SLPLUS_LOCK_PCT ?? CFG.EMERGENCY_SLPLUS_LOCK_PCT)+1))val=await paperUsdc.exitQuote({pos,book,snap,quote:jupiterQuote,txFee:CFG.TX_FEE_SOL});
       }else val=await paperUsdc.exitQuote({pos,book,snap,quote:jupiterQuote,txFee:CFG.TX_FEE_SOL});
       if(val.quoted){pos.lastQuoteAt=Date.now();if(Number.isFinite(val.tokenHaircut))pos.lastTokenHaircut=val.tokenHaircut;}   // calibration for the on-chain-mark fallback
       const policy={...CFG,...(pos.strategySettings||{})},pv={...v,n:policy.RESHAPE_N,reshape:policy.RESHAPE_ENABLED??true,compound:policy.COMPOUND_ENABLED??true}; // emergency derives from val.pnlPct (net USDC), never token-price drop
@@ -1974,7 +2080,7 @@ async function paperCycle(state) {
         downBins:(pos.lastReshapeActiveBin??pos.entryActiveBin)-snap.active.binId};
       live.quoteUnavailablePolls=pos.quoteUnavailablePolls||0;live.repositionRetryCount=pos.repositionRetryCount||0;
       pos.lastLive=live;
-      if(snap.active.binId>pos.maxBinId&&!val.quoted)log(`quote wait ${pos.name}: ${pos.quoteUnavailablePolls}/${policy.QUOTE_FAILURE_POLLS??10} consecutive failed polls; ${pos.quoteUnavailablePolls<(policy.QUOTE_FAILURE_POLLS??10)?'hold + retry next poll':'on-chain valuation allowed for OOR decision'}; emergency basis=net ${pos.capitalAsset||'USDC'}`);
+      if(snap.active.binId>pos.maxBinId&&!val.quoted)log(`quote wait ${pos.name}: ${pos.quoteUnavailablePolls}/${policy.QUOTE_FAILURE_POLLS ?? CFG.QUOTE_FAILURE_POLLS} consecutive failed polls; ${pos.quoteUnavailablePolls<(policy.QUOTE_FAILURE_POLLS ?? CFG.QUOTE_FAILURE_POLLS)?'hold + retry next poll':'on-chain valuation allowed for OOR decision'}; emergency basis=net ${pos.capitalAsset||'USDC'}`);
       log(`monitor [${v.id}] ${pos.name}: value=${live.valueQuote.toFixed(6)} ${live.quoteSymbol} pnlUsdc=${val.pnlUsd.toFixed(4)} pnlUsdcPct=${val.pnlPct.toFixed(4)}% exitUsdc=${val.usdcOut.toFixed(4)} peakUsd=${Number(pos.peakPnlUsd??0).toFixed(4)} quoted=${val.quoted} feesUsd=${live.feesUsd.toFixed(4)} age=${ageH.toFixed(2)}h inRange=${snap.inRange} shape=${pos.shape} active=${snap.active.binId} range=${pos.minBinId}..${pos.maxBinId} ${quotePnl.logFields(live)}`);
       if(exitReason==='oor_right_reposition'){
         const repositioned=await paperRepositionRight({...state,books:{[v.id]:book}},book,v,snap,val);
@@ -2002,6 +2108,10 @@ async function paperCycle(state) {
     if(paperStopRequested()||Date.now()>=Date.parse(meta.endsAt)||screenRefresh.status(PAPER_DIR,CFG,scan.last).stale)break;
     try{
      const result=await paperOpenAll(p,state);
+     // §5.6 #11: per-book open-attempt labelling (one stamp row per book
+     // per attempt; #12 syncGroup stays null until entry synchronisation
+     // is implemented — see config entrySync).
+     try{for(const v of VARIANTS){const opened=result.opened&&result.variants&&result.variants.includes(v.id);shadowStamps.stampOpenAttempt({paperDir:PAPER_DIR,at:now(),instance:'B1',pool:p,bookId:v.id,result:opened?'opened':'skipped',skipReason:opened?null:(result.skipped||'not openable in this book'),syncGroup:null});}}catch{}
      state.lastScan.openResults.push({pool:p.name,address:p.address,at:now(),...result});
      if(result.skipped){log('OPEN TERTUNDA '+p.name+': '+result.skipped+(p.entryCostEstimate?.skipCheck?'; nonref BYPASS, bukan penghalang':''));if(/Jupiter|quote|cooldown|429/i.test(result.skipped))state.nextEntryRetryAt=Math.max(Date.now()+30000,paperQuoteClient.status().blockedUntil||0);}
      if(result.opened)saveState(state,F('state.json'));
@@ -2219,7 +2329,7 @@ async function liveOpen(p, state, opts = {}) {
 async function liveOpenUsdcPool({ p, state, opts, policy, dlmm, active, binStep, plan, priceUi, rentRef, rentNon, px, usdcBal, solBal }) {
   const { minBinId, maxBinId } = plan, openFees = 2 * CFG.TX_FEE_SOL;
   const gas = paperCap.computeGasBufferSol({ rentRefundable: rentRef, rentNonRefundable: rentNon, txFee: CFG.TX_FEE_SOL, floor: policy.GAS_BUFFER_SOL ?? CFG.GAS_BUFFER_SOL });
-  const pl = await paperUsdc.planUsdcOpen({ cash: Math.min(usdcBal, opts.positionBudgetUsdc ?? (CFG.POSITION_USDC > 0 ? CFG.POSITION_USDC : usdcBal)), existingSol: 0, capUsd: (p.tvl || 0) * ((policy.MAX_POSITION_TVL_PCT ?? 5) / 100),
+  const pl = await paperUsdc.planUsdcOpen({ cash: Math.min(usdcBal, opts.positionBudgetUsdc ?? (CFG.POSITION_USDC > 0 ? CFG.POSITION_USDC : usdcBal)), existingSol: 0, capUsd: (p.tvl || 0) * ((policy.MAX_POSITION_TVL_PCT ?? CFG.MAX_POSITION_TVL_PCT) / 100),
     gasBuffer: gas.buffer, rentRef, rentNon, openFees, solUsd: px, usdcBuffer: CFG.USDC_BUFFER, quote: jupiterQuote });
   log(`open plan ${p.name} (USDC pool): bins ${minBinId}..${maxBinId}, USDC=${usdcBal.toFixed(2)} SOL=${solBal.toFixed(4)} ${pl.ok ? `deposit=${pl.depositQuote.toFixed(2)} USDC gasUsdc=${pl.gasUsdc.toFixed(2)}` : 'SKIP ' + pl.why}`);
   if (!pl.ok) return { skipped: pl.why };
@@ -2235,7 +2345,7 @@ async function liveOpenUsdcPool({ p, state, opts, policy, dlmm, active, binStep,
   if (reserve < 3 * CFG.TX_FEE_SOL) return { skipped: 'native buffer cannot cover rent + open + close fees', bought };
   const posKp = Keypair.generate(), balBefore = solBal, usdcIn = pl.depositQuote + pl.gasUsdc;
   const recordPosition = () => {
-    state.position = { pool: p.address, name: p.name, mintX: p.token_x.address, decX: p.token_x.decimals, position: posKp.publicKey.toBase58(), minBinId, maxBinId, openedAt: now(), entryPrice: priceUi, depositSol: pl.depositQuote, tvlCapped: pl.depositQuote >= (p.tvl || 0) * ((policy.MAX_POSITION_TVL_PCT ?? 5) / 100) - 1e-6, walletBefore: balBefore, usdcIn, solBought: bought, gasBufferSol: gas.buffer, stage: 'spot', rentPaidSol: rentRef + rentNon, rentRefundableSol: rentRef,
+    state.position = { pool: p.address, name: p.name, mintX: p.token_x.address, decX: p.token_x.decimals, position: posKp.publicKey.toBase58(), minBinId, maxBinId, openedAt: now(), entryPrice: priceUi, depositSol: pl.depositQuote, tvlCapped: pl.depositQuote >= (p.tvl || 0) * ((policy.MAX_POSITION_TVL_PCT ?? CFG.MAX_POSITION_TVL_PCT) / 100) - 1e-6, walletBefore: balBefore, usdcIn, solBought: bought, gasBufferSol: gas.buffer, stage: 'spot', rentPaidSol: rentRef + rentNon, rentRefundableSol: rentRef,
       tvlUsd: p.tvl, binStep, entryActiveBin: active.binId, capitalAsset: 'USDC', quoteMint: USDC, quoteSymbol: 'USDC', quoteDecimals: 6, depositQuote: pl.depositQuote, initialUsdcIn: usdcIn, leftoverSol: reserve,
       baseFeePct: p.pool_config?.base_fee_pct ?? p.pool_config?.base_fee_percentage ?? null, strategySettings: opts.strategySettings || strategy.snapshot(CFG), openSource: opts.source || 'scan' };
     Object.assign(state.position, { spotQuote: pl.depositQuote * plan.split, bidaskQuote: pl.depositQuote * (1 - plan.split), upperBufferBins: plan.upper, nBins: plan.width, origMinBinId: minBinId, origMaxBinId: maxBinId, shape: 'open-' + String(policy.OPEN_SHAPE || 'MIXED').toLowerCase() });
@@ -2531,6 +2641,9 @@ async function writePaperStatus(state, extra = {}) {
     virtualUsdc: primaryBook(state)?.virtual?.usdc,
     leftoverSol: primaryBook(state)?.virtual?.sol,
     config: {
+      profile: WARLOCK_CONFIG.profileName,
+      configPath: WARLOCK_CONFIG.configPath,
+      h17Enabled: WC.h17.enabled,
       paperUsdc: CFG.PAPER_USDC, usdcBuffer: CFG.USDC_BUFFER, gasBufferSol: CFG.GAS_BUFFER_SOL,
       positionSol: CFG.POSITION_SOL, reserveSol: CFG.RESERVE_SOL, tp: CFG.TP,tpUsdPct:CFG.TP_USD_PCT,oorRightClose:CFG.OOR_RIGHT_CLOSE,trailingEnabled:CFG.TRAIL_ENABLED,oorMaxMin:CFG.OOR_MAX_MIN,maxHours: CFG.MAX_HOURS,
       minLiqUsd: CFG.MIN_LIQ_USD, minAgeH: CFG.MIN_AGE_H, ftWindow: CFG.FT_WINDOW, minFt: CFG.MIN_FT, maxPosTvlFrac: CFG.MAX_POS_TVL_FRAC,
@@ -2545,6 +2658,7 @@ async function writePaperStatus(state, extra = {}) {
     },
     meta: state.meta,
     books: variantBookStats(state, extra),
+    paperHalt: VARIANTS.map((v) => paperHaltFor(v.id).status()),
     strategy: VARIANTS[0] && { id: VARIANTS[0].id, n: VARIANTS[0].n, reshape: VARIANTS[0].reshape, compound: VARIANTS[0].compound },
     positions: multi.positions(primaryBook(state)).map(publicPos),
     openCount:multi.positions(primaryBook(state)).length,maxPositions:CFG.MAX_POSITIONS,
@@ -2890,7 +3004,7 @@ async function liveCycle(state) {
       log(line);paperSettings.audit(PAPER_DIR,line);
     }
     const startUsdc = (primaryBook(state) && primaryBook(state).virtual && primaryBook(state).virtual.usdc) || CFG.PAPER_USDC;
-    log('Jupiter: '+jup.describe());log('RPC: '+require('./rpc-config').describe());log(`start PAPER: real wallet ${REAL_WALLET || '(belum ada key wallet)'} on-chain=${real == null ? 'n/a' : real.toFixed(5)} SOL (unused). strategy=BATCH1 parallel A(control TP13%/emTP10%/SL+3%) D(trailing 3%/drop 1.0pp, SL+ off) E(reshape-freeze-5, -20% backstop) B7(flat TP 7%); 4 books x $1000, $500/position, max 10/book. capital=${startUsdc} USDC only, GAS_BUFFER_SOL=${CFG.GAS_BUFFER_SOL} (extra SOL bought at each open for rent/tx, leftovers swapped back at close; no separate gas wallet), usdcBuffer=${CFG.USDC_BUFFER}, minLiq=$${CFG.MIN_LIQ_USD}, minAge=${CFG.MIN_AGE_H}h, minFt=${CFG.MIN_FT}%/${CFG.FT_WINDOW}, pump24h<=${CFG.MAX_PUMP_24H * 100}%, emergencyNetUsdcDrop=${CFG.EMERGENCY_DROP * 100}%, rugcheck=${CFG.RUGCHECK}, tvlCap=${CFG.MAX_POS_TVL_FRAC * 100}%, TP_USDC=${CFG.TP_USD_PCT}%, rightOorClose=${CFG.OOR_RIGHT_CLOSE}, trailing=${CFG.TRAIL_ENABLED}, maxHold=${CFG.MAX_HOURS}h, window ${state.meta.startedWib} -> ${state.meta.endsWib}. Private key not loaded. Live STOP file left in place; paper stop is paper/STOP or pm2 stop lp-paper.`);
+    log('Jupiter: '+jup.describe());log('RPC: '+require('./rpc-config').describe());log(`start PAPER: real wallet ${REAL_WALLET || '(belum ada key wallet)'} on-chain=${real == null ? 'n/a' : real.toFixed(5)} SOL (unused). profile=${WARLOCK_CONFIG.profileName} (config ${WARLOCK_CONFIG.configPath}); books=${VARIANTS.map(v=>v.id).join('/')} (Batch 1 parallel: A control TP13%/emTP10%/SL+3%, D trailing 3%/drop 1.0pp, E reshape-freeze-${WC.reshape.reshapeMax}, B7 flat TP 7%); ${VARIANTS.length} books x $${WC.paperHalt.bookUsd}, $${CFG.POSITION_USDC}/position, max ${CFG.MAX_POSITIONS}/book. capital=${startUsdc} USDC only, GAS_BUFFER_SOL=${CFG.GAS_BUFFER_SOL} (extra SOL bought at each open for rent/tx, leftovers swapped back at close; no separate gas wallet), usdcBuffer=${CFG.USDC_BUFFER}, minLiq=$${CFG.MIN_LIQ_USD}, minAge=${CFG.MIN_AGE_H}h, minFt=${CFG.MIN_FT}%/${CFG.FT_WINDOW}, pump24h<=${CFG.MAX_PUMP_24H * 100}%, emergencyNetUsdcDrop=${CFG.EMERGENCY_DROP * 100}%, rugcheck=${CFG.RUGCHECK}, tvlCap=${CFG.MAX_POS_TVL_FRAC * 100}%, TP_USDC=${CFG.TP_USD_PCT}%, rightOorClose=${CFG.OOR_RIGHT_CLOSE}, trailing=${CFG.TRAIL_ENABLED}, maxHold=${CFG.MAX_HOURS}h, h17=${WC.h17.enabled?'ON':'OFF'}, paperHalt=${WC.paperHalt.enabled?'ON': 'OFF'} (P1 ${WC.paperHalt.consecEmergencyStops} consec stops / P2 drawdown>$${WC.paperHalt.drawdownUsd} / P3 ${WC.paperHalt.consecLosses} consec losses < -$${WC.paperHalt.consecLossSumUsd}), window ${state.meta.startedWib} -> ${state.meta.endsWib}. Private key not loaded. Live STOP file left in place; paper stop is paper/STOP or pm2 stop lp-paper.`);
     log('paper valuation audit applied: bin prices/invariants verified; fallback = on-chain token mark minus SDK swap fee, native SOL conversion estimate 5 bps; Jupiter queue 1500ms + cache/backoff. Approved policy: unavailable OOR quote waits 10 polls; failed reopen retries; emergency is net entry capital asset (USDC/SOL), not token price.');
     saveState(state, F('state.json'));
     writeAllHistory(state);

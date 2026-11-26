@@ -4,7 +4,7 @@
   "description": "",
   "main": "index.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "test": "node test-configurable-v1.js && node test-live-bugfix.js && node test-live-swapback.js && node test-rpc-config.js && node test-rpc-failover.js && node test-live-swap-confirm.js && node test-live-bugfix-runtime.js"
   },
   "keywords": [],
   "author": "",
