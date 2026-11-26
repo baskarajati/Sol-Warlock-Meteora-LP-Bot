@@ -350,7 +350,9 @@ async function realSolBal(pk = (REAL_WALLET ? USER_PUB : null)) {
 }
 
 let solUsdCache = { t: 0, px: 0 };
-// Review fix (24 Nov 2026): a third source (a Jupiter 1 SOL -> USDC quote, the same API the swaps use) and an age limit.
+// W13 (26 Nov 2026): Jupiter Price API v3 is the first SOL/USD source. The
+// previous first source rate-limited (429s) and starved the price feed (14 in
+// the H17-SOL run log alone). DexScreener second, Jupiter swap quote third.
 // The cache used to return the last price forever. Opens now need a price at most SOL_USD_OPEN_MAX_AGE_MS old
 // (fresh: true); exits may still use an older price (an old price is better than no emergency stop), with a warning.
 const SOL_USD_OPEN_MAX_AGE_MS = 10 * 60_000;
@@ -358,10 +360,10 @@ let solUsdStaleLogAt = 0;
 async function solUsd({ fresh = false } = {}) {
   if (Date.now() - solUsdCache.t < 60_000 && solUsdCache.px) return solUsdCache.px;
   try {
-    const j = await getJSON('https://api.coingecko.com/api/v3/simple/price?ids=solana&vs_currencies=usd', {}, 2);
-    const px = +j?.solana?.usd;
+    const j = await getJSON('https://lite-api.jup.ag/price/v3?ids=' + SOL, {}, 2);
+    const px = +j?.[SOL]?.usdPrice;
     if (px > 0) { solUsdCache = { t: Date.now(), px }; halt.noteSolUsdAt(Date.now(), px); return px; }   // Item 1: feed freshness for the stale-feed rule + last-good price for the N1 conversion / N2 close fallback
-  } catch (e) { log('coingecko sol usd: ' + e.message); }
+  } catch (e) { log('jupiter price sol usd: ' + e.message); }
   try {
     const j = await getJSON('https://api.dexscreener.com/latest/dex/tokens/' + SOL, {}, 2);
     const px = +(j?.pairs?.[0]?.priceUsd || 0);
@@ -371,7 +373,7 @@ async function solUsd({ fresh = false } = {}) {
     const q = await jupiterQuote(SOL, USDC, 1_000_000_000n, 9, 6);
     const px = q && q.ok ? +q.outUi : 0;
     if (px > 0) { solUsdCache = { t: Date.now(), px }; halt.noteSolUsdAt(Date.now(), px); return px; }   // Item 1: feed freshness for the stale-feed rule + last-good price for the N1 conversion / N2 close fallback
-  } catch (e) { log('jupiter sol usd: ' + e.message); }
+  } catch (e) { log('jupiter quote sol usd: ' + e.message); }
   const age = Date.now() - solUsdCache.t;
   if (!solUsdCache.px) return 0;
   if (fresh && age > SOL_USD_OPEN_MAX_AGE_MS) { log(`sol usd: all sources failed, last price is ${Math.round(age / 60000)} min old: not used for an open`); return 0; }
